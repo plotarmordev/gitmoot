@@ -22,7 +22,7 @@ const (
 	HomepageURL     = "https://gitmoot.io"
 	PrivacyURL      = "https://gitmoot.io/privacy"
 	TermsURL        = "https://gitmoot.io/terms"
-	License         = "MIT"
+	License         = "Apache-2.0"
 	MarketplaceName = "gitmoot-local"
 
 	skillRoot = "gitmoot"

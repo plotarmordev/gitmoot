@@ -35,6 +35,9 @@ func TestBuildCodexPackage(t *testing.T) {
 	if got := manifest["version"]; got != "1.2.3" {
 		t.Fatalf("manifest version = %v, want 1.2.3", got)
 	}
+	if got := manifest["license"]; got != License {
+		t.Fatalf("manifest license = %v, want %q", got, License)
+	}
 	if got := manifest["skills"]; got != "./skills/" {
 		t.Fatalf("manifest skills = %v, want ./skills/", got)
 	}
@@ -73,6 +76,9 @@ func TestBuildClaudePackage(t *testing.T) {
 	}
 	if got := manifest["version"]; got != "0.0.0-dev" {
 		t.Fatalf("manifest version = %v, want 0.0.0-dev", got)
+	}
+	if got := manifest["license"]; got != License {
+		t.Fatalf("manifest license = %v, want %q", got, License)
 	}
 	if _, ok := manifest["skills"]; ok {
 		t.Fatalf("claude manifest should not include codex skills pointer: %#v", manifest)

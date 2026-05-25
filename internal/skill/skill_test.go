@@ -14,7 +14,7 @@ func TestCanonicalSkillFrontmatter(t *testing.T) {
 	for _, want := range []string{
 		"name: gitmoot",
 		"description: Use Gitmoot",
-		"license: MIT",
+		"license: Apache-2.0",
 		"compatibility:",
 		"metadata:",
 		"gitmoot-version:",

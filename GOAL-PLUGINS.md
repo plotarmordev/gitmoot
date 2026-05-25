@@ -253,7 +253,7 @@ Requirements:
   - description: local-first GitHub PR agent coordination
   - version from `buildinfo.Current()` when available
   - repository URL: `https://github.com/plotarmordev/gitmoot`
-  - license: `MIT`
+  - license: `Apache-2.0`
 - Refuse to build when the canonical skill directory is missing, empty, or does
   not include `SKILL.md`.
 - Keep recursive copy, directory cleanup, JSON write, and path normalization

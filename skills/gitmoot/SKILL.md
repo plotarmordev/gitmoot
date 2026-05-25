@@ -1,7 +1,7 @@
 ---
 name: gitmoot
 description: Use Gitmoot for local-first multi-agent coordination through GitHub PR comments, structured implementation plans, standard goal files, repo-scoped agent subscriptions, daemon checks, jobs, branch locks, presets, custom prompt agents, and Codex or Claude Code runtime workflows.
-license: MIT
+license: Apache-2.0
 compatibility: Requires the gitmoot CLI, git, GitHub CLI authentication, network access to GitHub, and a supported runtime such as Codex or Claude Code.
 metadata:
   gitmoot-version: "0.1.0"

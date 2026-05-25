@@ -190,6 +190,11 @@ gitmoot preset update frontend-reviewer
 - GitHub comments are authored by the authenticated `gh` user. Agent identity
   appears in the comment body.
 
+## License
+
+Gitmoot is licensed under the [Apache License 2.0](./LICENSE). See
+[NOTICE](./NOTICE) for copyright and attribution details.
+
 ## Development
 
 ```sh
