@@ -669,10 +669,13 @@ func TestResourceLockMethods(t *testing.T) {
 
 	now := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
 	lock := ResourceLock{
-		ResourceKey: "runtime:codex:session-a",
-		OwnerJobID:  "job-a",
-		OwnerToken:  "token-a",
-		ExpiresAt:   now.Add(time.Minute).Format(time.RFC3339Nano),
+		ResourceKey:   "runtime:codex:session-a",
+		OwnerJobID:    "job-a",
+		OwnerToken:    "token-a",
+		OwnerPID:      12345,
+		OwnerHostname: "host-a",
+		CommandHash:   "hash-a",
+		ExpiresAt:     now.Add(time.Minute).Format(time.RFC3339Nano),
 	}
 	acquired, err := store.AcquireResourceLock(ctx, lock, now)
 	if err != nil {
@@ -709,11 +712,24 @@ func TestResourceLockMethods(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetResourceLock returned error: %v", err)
 	}
-	if stored.OwnerJobID != "job-a" || stored.OwnerToken != "token-a" || stored.AcquiredAt == "" || stored.UpdatedAt == "" || stored.ExpiresAt == "" {
+	if stored.OwnerJobID != "job-a" || stored.OwnerToken != "token-a" || stored.OwnerPID != 12345 || stored.OwnerHostname != "host-a" || stored.CommandHash != "hash-a" || stored.AcquiredAt == "" || stored.UpdatedAt == "" || stored.ExpiresAt == "" {
 		t.Fatalf("resource lock = %+v", stored)
 	}
 	if stored.ExpiresAt != formatResourceLockTime(now.Add(time.Minute)) {
 		t.Fatalf("resource lock expiry = %q, want fixed-width timestamp", stored.ExpiresAt)
+	}
+	if updated, err := store.HeartbeatResourceLock(ctx, lock.ResourceKey, "job-a", "wrong-token", now.Add(20*time.Second), now.Add(2*time.Minute)); err != nil || updated {
+		t.Fatalf("wrong-token HeartbeatResourceLock returned updated=%v err=%v", updated, err)
+	}
+	if updated, err := store.HeartbeatResourceLock(ctx, lock.ResourceKey, "job-a", "token-a", now.Add(30*time.Second), now.Add(2*time.Minute)); err != nil || !updated {
+		t.Fatalf("HeartbeatResourceLock returned updated=%v err=%v", updated, err)
+	}
+	stored, err = store.GetResourceLock(ctx, lock.ResourceKey)
+	if err != nil {
+		t.Fatalf("GetResourceLock after heartbeat returned error: %v", err)
+	}
+	if stored.UpdatedAt != formatResourceLockTime(now.Add(30*time.Second)) || stored.ExpiresAt != formatResourceLockTime(now.Add(2*time.Minute)) {
+		t.Fatalf("heartbeat lock times = updated %q expires %q", stored.UpdatedAt, stored.ExpiresAt)
 	}
 	released, err := store.ReleaseResourceLock(ctx, lock.ResourceKey, "job-b", "token-a")
 	if err != nil {
@@ -783,6 +799,42 @@ func TestResourceLockRecoversExpiredLock(t *testing.T) {
 	}
 	if deleted != 1 {
 		t.Fatalf("expired locks deleted = %d, want 1", deleted)
+	}
+}
+
+func TestResourceLockCleanupSkipsPIDBackedLease(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	defer store.Close()
+
+	now := time.Date(2026, 5, 26, 12, 0, 0, 0, time.UTC)
+	if acquired, err := store.AcquireResourceLock(ctx, ResourceLock{
+		ResourceKey:   "skillopt-train:session-a:iteration-a",
+		OwnerJobID:    "local-skillopt-train-optimizer-a",
+		OwnerToken:    "token-a",
+		OwnerPID:      12345,
+		OwnerHostname: "host-a",
+		CommandHash:   "hash-a",
+		ExpiresAt:     now.Add(time.Minute).Format(time.RFC3339Nano),
+	}, now); err != nil || !acquired {
+		t.Fatalf("AcquireResourceLock returned acquired=%v err=%v", acquired, err)
+	}
+	deleted, err := store.DeleteExpiredResourceLocks(ctx, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("DeleteExpiredResourceLocks returned error: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("expired pid-backed locks deleted = %d, want 0", deleted)
+	}
+	stored, err := store.GetResourceLock(ctx, "skillopt-train:session-a:iteration-a")
+	if err != nil {
+		t.Fatalf("GetResourceLock returned error: %v", err)
+	}
+	if stored.OwnerPID != 12345 || stored.CommandHash != "hash-a" {
+		t.Fatalf("resource lock metadata = pid %d hash %q, want pid 12345 hash-a", stored.OwnerPID, stored.CommandHash)
 	}
 }
 
