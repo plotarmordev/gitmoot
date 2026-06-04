@@ -326,12 +326,15 @@ type BranchLockEvent struct {
 }
 
 type ResourceLock struct {
-	ResourceKey string
-	OwnerJobID  string
-	OwnerToken  string
-	AcquiredAt  string
-	UpdatedAt   string
-	ExpiresAt   string
+	ResourceKey   string
+	OwnerJobID    string
+	OwnerToken    string
+	OwnerPID      int64
+	OwnerHostname string
+	CommandHash   string
+	AcquiredAt    string
+	UpdatedAt     string
+	ExpiresAt     string
 }
 
 type MergeGate struct {
@@ -3009,8 +3012,8 @@ func (s *Store) AcquireResourceLock(ctx context.Context, lock ResourceLock, now 
 			)`, resourceKey, nowText); err != nil {
 		return false, err
 	}
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO resource_locks(resource_key, owner_job_id, owner_token, acquired_at, updated_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?)`, resourceKey, ownerJobID, ownerToken, nowText, nowText, expiresAt)
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO resource_locks(resource_key, owner_job_id, owner_token, owner_pid, owner_hostname, command_hash, acquired_at, updated_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, resourceKey, ownerJobID, ownerToken, lock.OwnerPID, strings.TrimSpace(lock.OwnerHostname), strings.TrimSpace(lock.CommandHash), nowText, nowText, expiresAt)
 	if err != nil {
 		return false, err
 	}
@@ -3025,12 +3028,27 @@ func (s *Store) AcquireResourceLock(ctx context.Context, lock ResourceLock, now 
 }
 
 func (s *Store) GetResourceLock(ctx context.Context, resourceKey string) (ResourceLock, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT resource_key, owner_job_id, owner_token, acquired_at, updated_at, expires_at FROM resource_locks WHERE resource_key = ?`, resourceKey)
+	row := s.db.QueryRowContext(ctx, `SELECT resource_key, owner_job_id, owner_token, owner_pid, owner_hostname, command_hash, acquired_at, updated_at, expires_at FROM resource_locks WHERE resource_key = ?`, resourceKey)
 	var lock ResourceLock
-	if err := row.Scan(&lock.ResourceKey, &lock.OwnerJobID, &lock.OwnerToken, &lock.AcquiredAt, &lock.UpdatedAt, &lock.ExpiresAt); err != nil {
+	if err := row.Scan(&lock.ResourceKey, &lock.OwnerJobID, &lock.OwnerToken, &lock.OwnerPID, &lock.OwnerHostname, &lock.CommandHash, &lock.AcquiredAt, &lock.UpdatedAt, &lock.ExpiresAt); err != nil {
 		return ResourceLock{}, err
 	}
 	return lock, nil
+}
+
+func (s *Store) HeartbeatResourceLock(ctx context.Context, resourceKey string, ownerJobID string, ownerToken string, now time.Time, expiresAt time.Time) (bool, error) {
+	result, err := s.db.ExecContext(ctx, `UPDATE resource_locks
+		SET updated_at = ?, expires_at = ?
+		WHERE resource_key = ? AND owner_job_id = ? AND owner_token = ?`,
+		formatResourceLockTime(now), formatResourceLockTime(expiresAt), strings.TrimSpace(resourceKey), strings.TrimSpace(ownerJobID), strings.TrimSpace(ownerToken))
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected == 1, nil
 }
 
 func (s *Store) ReleaseResourceLock(ctx context.Context, resourceKey string, ownerJobID string, ownerToken string) (bool, error) {
@@ -3048,6 +3066,7 @@ func (s *Store) ReleaseResourceLock(ctx context.Context, resourceKey string, own
 func (s *Store) DeleteExpiredResourceLocks(ctx context.Context, now time.Time) (int64, error) {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM resource_locks
 		WHERE expires_at <= ?
+			AND owner_pid <= 0
 			AND NOT EXISTS (
 				SELECT 1 FROM jobs
 				WHERE jobs.id = resource_locks.owner_job_id
@@ -3870,5 +3889,10 @@ ALTER TABLE ranked_feedback_events ADD COLUMN promote TEXT NOT NULL DEFAULT '';
 	`,
 	`
 ALTER TABLE ranked_feedback_events ADD COLUMN required_improvements_json TEXT NOT NULL DEFAULT '';
+	`,
+	`
+ALTER TABLE resource_locks ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE resource_locks ADD COLUMN owner_hostname TEXT NOT NULL DEFAULT '';
+ALTER TABLE resource_locks ADD COLUMN command_hash TEXT NOT NULL DEFAULT '';
 	`,
 }
