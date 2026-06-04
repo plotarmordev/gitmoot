@@ -82,7 +82,7 @@ func printSkillOptUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot skillopt feedback github sync --run <run-id> [--repo owner/repo] (--issue <number>|--pr <number>)")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
-	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
+	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
 }
 
@@ -111,7 +111,7 @@ func printSkillOptTrainUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot skillopt train start --template <id> --repo owner/repo --request <text> --items-file path [--session <id>] [--workspace-repo owner/repo] [--preview-repo owner/repo] [--preview-mode none|optional|required] [--preview-renderer none|vue-vite] [--preview-publisher none|github-pages] [--preview-route-template template] [--request-file path] [--task-kind kind] [--mode explore|refine|distill|validate] [--exploration-level high|medium|low] [--options N] [--min-items N] [--preferred-gate hard|soft|hard_then_soft] [--dry-run] [--yes]")
 	fmt.Fprintln(w, "  gitmoot skillopt train status --session <id>")
-	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
+	fmt.Fprintln(w, "  gitmoot skillopt train continue --session <id> [--backend codex] [--generator-type skillopt-generator | --generator-agent name] [--skillopt-bin path] [--model name] [--optimizer-model name] [--target-model name] [--optimizer-backend name] [--target-backend name] [--evaluator-id id] [--evaluator-model name] [--evaluator-backend name] [--skill-update-mode mode] [--num-epochs N] [--batch-size N] [--gate hard|soft|mixed] [--out-root path] [--timeout duration] [--dry-run] [--rerun-optimizer] [--promote version|--reject version --reason text] [--start-next]")
 	fmt.Fprintln(w, "  gitmoot skillopt train stop --session <id> --reason <text>")
 }
 
@@ -562,6 +562,7 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 	generatorAgent := fs.String("generator-agent", "", "existing agent to use for option generation")
 	generatorType := fs.String("generator-type", "", "managed agent type to use for option generation; defaults to skillopt-generator")
 	skillOptBin := fs.String("skillopt-bin", "", "gitmoot-skillopt executable path; defaults to gitmoot-skillopt on PATH")
+	backend := fs.String("backend", "", "backend preset for optimizer, target, and evaluator; currently supports codex")
 	model := fs.String("model", "", "model name to pass to both optimizer and target when specific model flags are omitted")
 	optimizerModel := fs.String("optimizer-model", "", "optimizer model name")
 	targetModel := fs.String("target-model", "", "target model name")
@@ -614,6 +615,7 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 			GeneratorType:  *generatorType,
 			Optimizer: skillOptTrainOptimizerRequest{
 				SkillOptBin:      *skillOptBin,
+				Backend:          *backend,
 				Model:            *model,
 				OptimizerModel:   *optimizerModel,
 				TargetModel:      *targetModel,
@@ -638,19 +640,28 @@ func runSkillOptTrainContinue(args []string, stdout, stderr io.Writer) int {
 		})
 		return err
 	}); err != nil {
+		if output.Summary.CurrentPhase != "" || len(output.Lines) > 0 {
+			printSkillOptTrainContinueOutput(stdout, output)
+		}
 		fmt.Fprintf(stderr, "skillopt train continue: %v\n", err)
 		return 1
 	}
-	printSkillOptTrainStatus(stdout, output.Summary, output.Counts)
+	printSkillOptTrainContinueOutput(stdout, output)
 	if output.Summary.CurrentPhase == skillopt.TrainStateRunAbandoned {
 		fmt.Fprintln(stderr, "skillopt train continue: train session is abandoned")
 		return 1
+	}
+	return 0
+}
+
+func printSkillOptTrainContinueOutput(stdout io.Writer, output skillOptTrainContinueOutput) {
+	if output.Summary.CurrentPhase != "" {
+		printSkillOptTrainStatus(stdout, output.Summary, output.Counts)
 	}
 	writeLine(stdout, "continue_ready: %t", output.ContinueReady)
 	for _, line := range output.Lines {
 		writeLine(stdout, "%s", line)
 	}
-	return 0
 }
 
 type skillOptTrainContinueRequest struct {
@@ -668,6 +679,7 @@ type skillOptTrainContinueRequest struct {
 
 type skillOptTrainOptimizerRequest struct {
 	SkillOptBin      string
+	Backend          string
 	Model            string
 	OptimizerModel   string
 	TargetModel      string
@@ -962,21 +974,17 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 		}
 		result, err := continueSkillOptTrainOptimizer(ctx, paths, store, session, *iteration, request.Optimizer)
 		if err != nil {
-			return skillOptTrainContinueOutput{}, err
+			if skillOptTrainOptimizerResultHasReport(result) {
+				output.Lines = skillOptTrainOptimizerReportLines(result)
+			}
+			return output, err
 		}
 		updatedSession, updatedIteration, updatedCounts, err := loadSkillOptTrainStatus(ctx, store, session.ID)
 		if err != nil {
 			return skillOptTrainContinueOutput{}, err
 		}
 		updatedSummary := skillopt.BuildTrainStatusSummary(updatedSession, updatedIteration, updatedCounts)
-		lines := []string{
-			fmt.Sprintf("training_package: %s", result.TrainingPackagePath),
-			fmt.Sprintf("optimizer_out_root: %s", result.OutRoot),
-			fmt.Sprintf("candidate_package: %s", result.CandidatePackagePath),
-			fmt.Sprintf("artifact_dir: %s", result.ArtifactDir),
-			fmt.Sprintf("optimizer_command: %s", shellArgs(append([]string{result.Command}, result.Args...))),
-			fmt.Sprintf("optimizer_dry_run: %t", result.DryRun),
-		}
+		lines := skillOptTrainOptimizerReportLines(result)
 		if result.NoCandidateReason != "" {
 			lines = append(lines,
 				fmt.Sprintf("no_candidate_reason: %s", result.NoCandidateReason),
@@ -1182,9 +1190,21 @@ type skillOptTrainOptimizerResult struct {
 	Command               string
 	Args                  []string
 	DryRun                bool
+	BackendResolution     skillOptTrainBackendResolution
+	RecoveryAvailable     bool
+	OptimizerLockState    string
 	CandidateVersionID    string
 	NoCandidateReason     string
 	NoCandidateNextAction string
+}
+
+type skillOptTrainBackendResolution struct {
+	Backend               string
+	OptimizerBackend      string
+	TargetBackend         string
+	InternalTargetAdapter string
+	EvaluatorBackend      string
+	ConfigStatus          string
 }
 
 type skillOptTrainOptimizerPaths struct {
@@ -2361,6 +2381,11 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 	if strings.TrimSpace(iteration.EvalRunID) == "" {
 		return skillOptTrainOptimizerResult{}, fmt.Errorf("train iteration %s has no eval run id", iteration.ID)
 	}
+	resolvedRequest, backendResolution, err := resolveSkillOptTrainBackendRequest(request)
+	if err != nil {
+		return skillOptTrainOptimizerResult{}, err
+	}
+	request = resolvedRequest
 	optimizerPaths, err := resolveSkillOptTrainOptimizerPaths(paths, session, iteration, request)
 	if err != nil {
 		return skillOptTrainOptimizerResult{}, err
@@ -2371,6 +2396,9 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		CandidatePackagePath: optimizerPaths.CandidatePackagePath,
 		ArtifactDir:          optimizerPaths.ArtifactDir,
 		DryRun:               request.DryRun,
+		BackendResolution:    backendResolution,
+		RecoveryAvailable:    skillOptTrainOptimizerRecoveryAvailable(optimizerPaths),
+		OptimizerLockState:   "acquired",
 	}
 	state := skillopt.NormalizeTrainState(iteration.State)
 	if state == skillopt.TrainStateOptimizerCompleted && request.RerunOptimizer {
@@ -2387,17 +2415,17 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		}
 		exportMetadata, err := exportSkillOptTrainPackage(ctx, store, iteration, optimizerPaths)
 		if err != nil {
-			return skillOptTrainOptimizerResult{}, err
+			return result, err
 		}
 		session.State = skillopt.TrainStateTrainingPackageCreated
 		iteration.State = skillopt.TrainStateTrainingPackageCreated
 		session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "optimizer", exportMetadata)
 		iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "optimizer", exportMetadata)
 		if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
-			return skillOptTrainOptimizerResult{}, err
+			return result, err
 		}
 		if err := store.UpsertSkillOptTrainIteration(ctx, iteration); err != nil {
-			return skillOptTrainOptimizerResult{}, err
+			return result, err
 		}
 		state = skillopt.TrainStateTrainingPackageCreated
 	}
@@ -2408,18 +2436,19 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		command, args, err := buildSkillOptTrainOptimizerCommand(iteration, request, optimizerPaths)
 		if err != nil {
 			if metaErr := recordSkillOptTrainOptimizerFailure(ctx, store, session, iteration, request, optimizerPaths, command, args, subprocess.Result{}, err); metaErr != nil {
-				return skillOptTrainOptimizerResult{}, fmt.Errorf("%w; failed to record optimizer failure: %v", err, metaErr)
+				return result, fmt.Errorf("%w; failed to record optimizer failure: %v", err, metaErr)
 			}
-			return skillOptTrainOptimizerResult{}, err
+			return result, err
 		}
 		result.Command = command
 		result.Args = args
 		runResult, err := runSkillOptTrainOptimizer(ctx, optimizerPaths, request, command, args)
+		result.RecoveryAvailable = skillOptTrainOptimizerRecoveryAvailable(optimizerPaths)
 		if err != nil {
 			if metaErr := recordSkillOptTrainOptimizerFailure(ctx, store, session, iteration, request, optimizerPaths, command, args, runResult, err); metaErr != nil {
-				return skillOptTrainOptimizerResult{}, fmt.Errorf("%w; failed to record optimizer failure: %v", err, metaErr)
+				return result, fmt.Errorf("%w; failed to record optimizer failure: %v", err, metaErr)
 			}
-			return skillOptTrainOptimizerResult{}, err
+			return result, err
 		}
 		metadata := skillOptTrainOptimizerMetadata(request, optimizerPaths, command, args, runResult, "succeeded", nil)
 		session.State = skillopt.TrainStateOptimizerCompleted
@@ -2427,10 +2456,10 @@ func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, sto
 		session.MetadataJSON = mergeSkillOptTrainMetadata(session.MetadataJSON, "optimizer", metadata)
 		iteration.MetadataJSON = mergeSkillOptTrainMetadata(iteration.MetadataJSON, "optimizer", metadata)
 		if err := store.UpsertSkillOptTrainSession(ctx, session); err != nil {
-			return skillOptTrainOptimizerResult{}, err
+			return result, err
 		}
 		if err := store.UpsertSkillOptTrainIteration(ctx, iteration); err != nil {
-			return skillOptTrainOptimizerResult{}, err
+			return result, err
 		}
 		state = skillopt.TrainStateOptimizerCompleted
 	}
@@ -4637,6 +4666,109 @@ func recordSkillOptTrainGenerationFailure(ctx context.Context, store *db.Store, 
 	return store.UpsertSkillOptTrainIteration(ctx, iteration)
 }
 
+func resolveSkillOptTrainBackendRequest(request skillOptTrainOptimizerRequest) (skillOptTrainOptimizerRequest, skillOptTrainBackendResolution, error) {
+	preset := strings.TrimSpace(strings.ToLower(request.Backend))
+	switch preset {
+	case "":
+		optimizerBackend := strings.TrimSpace(request.OptimizerBackend)
+		if optimizerBackend == "" {
+			optimizerBackend = "openai_chat"
+		}
+		internalTargetAdapter := strings.TrimSpace(request.TargetBackend)
+		if internalTargetAdapter == "" {
+			internalTargetAdapter = "openai_chat"
+		}
+		evaluatorBackend := strings.TrimSpace(request.EvaluatorBackend)
+		if evaluatorBackend == "" {
+			evaluatorBackend = optimizerBackend
+		}
+		resolution := skillOptTrainBackendResolution{
+			Backend:               "custom",
+			OptimizerBackend:      optimizerBackend,
+			TargetBackend:         skillOptTrainDisplayTargetBackend(internalTargetAdapter),
+			InternalTargetAdapter: internalTargetAdapter,
+			EvaluatorBackend:      evaluatorBackend,
+		}
+		resolution.ConfigStatus = skillOptTrainBackendConfigStatus(resolution)
+		return request, resolution, nil
+	case "codex":
+		if err := skillOptTrainBackendPresetConflict("--optimizer-backend", request.OptimizerBackend, "codex"); err != nil {
+			return skillOptTrainOptimizerRequest{}, skillOptTrainBackendResolution{}, err
+		}
+		if err := skillOptTrainCodexTargetBackendConflict(request.TargetBackend); err != nil {
+			return skillOptTrainOptimizerRequest{}, skillOptTrainBackendResolution{}, err
+		}
+		if err := skillOptTrainBackendPresetConflict("--evaluator-backend", request.EvaluatorBackend, "codex"); err != nil {
+			return skillOptTrainOptimizerRequest{}, skillOptTrainBackendResolution{}, err
+		}
+		request.OptimizerBackend = "codex"
+		request.TargetBackend = "codex_exec"
+		request.EvaluatorBackend = "codex"
+		resolution := skillOptTrainBackendResolution{
+			Backend:               "codex",
+			OptimizerBackend:      "codex",
+			TargetBackend:         "codex",
+			InternalTargetAdapter: "codex_exec",
+			EvaluatorBackend:      "codex",
+			ConfigStatus:          "codex_no_azure_or_openai_required",
+		}
+		return request, resolution, nil
+	default:
+		return skillOptTrainOptimizerRequest{}, skillOptTrainBackendResolution{}, fmt.Errorf("backend preset %q is not supported; use codex or explicit backend flags", preset)
+	}
+}
+
+func skillOptTrainBackendPresetConflict(flagName string, value string, expected string) error {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" || value == expected {
+		return nil
+	}
+	return fmt.Errorf("--backend codex conflicts with %s %q; omit %s or set it to %s", flagName, value, flagName, expected)
+}
+
+func skillOptTrainCodexTargetBackendConflict(value string) error {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" || value == "codex" || value == "codex_exec" {
+		return nil
+	}
+	return fmt.Errorf("--backend codex conflicts with --target-backend %q; omit --target-backend or use codex/codex_exec", value)
+}
+
+func skillOptTrainDisplayTargetBackend(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.EqualFold(value, "codex_exec") {
+		return "codex"
+	}
+	return value
+}
+
+func skillOptTrainBackendConfigStatus(resolution skillOptTrainBackendResolution) string {
+	backends := []string{
+		resolution.OptimizerBackend,
+		resolution.InternalTargetAdapter,
+		resolution.EvaluatorBackend,
+	}
+	anyBackend := false
+	externalCredentials := false
+	for _, backend := range backends {
+		backend = strings.TrimSpace(strings.ToLower(backend))
+		if backend == "" {
+			continue
+		}
+		anyBackend = true
+		if backend == "openai_chat" || backend == "azure_openai" || strings.Contains(backend, "openai") || strings.Contains(backend, "azure") {
+			externalCredentials = true
+		}
+	}
+	if !anyBackend {
+		return "using_optimizer_defaults"
+	}
+	if externalCredentials {
+		return "external_credentials_may_be_required"
+	}
+	return "no_azure_or_openai_required"
+}
+
 func resolveSkillOptTrainOptimizerPaths(paths config.Paths, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest) (skillOptTrainOptimizerPaths, error) {
 	outRoot := strings.TrimSpace(request.OutRoot)
 	optimizerMetadata := decodedSkillOptMetadataValue(decodedSkillOptMetadata(iteration.MetadataJSON)["optimizer"])
@@ -4722,7 +4854,30 @@ func exportSkillOptTrainPackage(ctx context.Context, store *db.Store, iteration 
 	}, nil
 }
 
+func skillOptTrainOptimizerRecoveryAvailable(paths skillOptTrainOptimizerPaths) bool {
+	for _, path := range []string{
+		paths.CandidatePackagePath,
+		filepath.Join(paths.OutRoot, "summary.json"),
+		filepath.Join(paths.OutRoot, "runtime_state.json"),
+		filepath.Join(paths.OutRoot, "history.json"),
+		filepath.Join(paths.OutRoot, "best_skill.md"),
+	} {
+		if strings.TrimSpace(path) == "" {
+			continue
+		}
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 func buildSkillOptTrainOptimizerCommand(iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest, paths skillOptTrainOptimizerPaths) (string, []string, error) {
+	resolvedRequest, _, err := resolveSkillOptTrainBackendRequest(request)
+	if err != nil {
+		return "", nil, err
+	}
+	request = resolvedRequest
 	executable := strings.TrimSpace(request.SkillOptBin)
 	if executable == "" {
 		executable = "gitmoot-skillopt"
@@ -4940,6 +5095,38 @@ func skillOptNoCandidateReason(err error) string {
 
 func skillOptNoCandidateNextAction() string {
 	return "do not publish a candidate review; revise feedback and start another iteration, rerun the optimizer with --rerun-optimizer, or stop"
+}
+
+func skillOptTrainOptimizerReportLines(result skillOptTrainOptimizerResult) []string {
+	lines := []string{
+		fmt.Sprintf("training_package: %s", result.TrainingPackagePath),
+		fmt.Sprintf("optimizer_out_root: %s", result.OutRoot),
+		fmt.Sprintf("candidate_package: %s", result.CandidatePackagePath),
+		fmt.Sprintf("artifact_dir: %s", result.ArtifactDir),
+		fmt.Sprintf("backend: %s", result.BackendResolution.Backend),
+		fmt.Sprintf("optimizer_backend: %s", emptyText(result.BackendResolution.OptimizerBackend)),
+		fmt.Sprintf("target_backend: %s", emptyText(result.BackendResolution.TargetBackend)),
+		fmt.Sprintf("internal_target_adapter: %s", emptyText(result.BackendResolution.InternalTargetAdapter)),
+		fmt.Sprintf("evaluator_backend: %s", emptyText(result.BackendResolution.EvaluatorBackend)),
+		fmt.Sprintf("backend_config_status: %s", result.BackendResolution.ConfigStatus),
+		fmt.Sprintf("optimizer_lock: %s", result.OptimizerLockState),
+		fmt.Sprintf("recovery_available: %t", result.RecoveryAvailable),
+	}
+	if strings.TrimSpace(result.Command) != "" {
+		lines = append(lines, fmt.Sprintf("optimizer_command: %s", shellArgs(append([]string{result.Command}, result.Args...))))
+	} else {
+		lines = append(lines, "optimizer_command: -")
+	}
+	lines = append(lines, fmt.Sprintf("optimizer_dry_run: %t", result.DryRun))
+	return lines
+}
+
+func skillOptTrainOptimizerResultHasReport(result skillOptTrainOptimizerResult) bool {
+	return strings.TrimSpace(result.TrainingPackagePath) != "" ||
+		strings.TrimSpace(result.OutRoot) != "" ||
+		strings.TrimSpace(result.CandidatePackagePath) != "" ||
+		strings.TrimSpace(result.ArtifactDir) != "" ||
+		strings.TrimSpace(result.BackendResolution.Backend) != ""
 }
 
 func importSkillOptTrainCandidate(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, optimizerPaths skillOptTrainOptimizerPaths) (db.AgentTemplateVersion, error) {

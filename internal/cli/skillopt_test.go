@@ -2564,6 +2564,121 @@ func TestSkillOptTrainContinueRunsOptimizerAndImportsCandidate(t *testing.T) {
 	}
 }
 
+func TestSkillOptTrainContinueBackendCodexResolvesPresetAndReportsPreflight(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	outRoot := filepath.Join(t.TempDir(), "optimizer")
+	candidate := cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with codex backend preset guidance.")
+	runner := &skillOptTrainFakeOptimizerRunner{
+		candidate: candidate,
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--backend", "codex",
+		"--target-backend", "codex",
+		"--evaluator-id", "landing_page_v1",
+		"--out-root", outRoot,
+		"--dry-run",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train continue codex backend exit code = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{
+		"current_phase: candidate_created",
+		"backend: codex",
+		"optimizer_backend: codex",
+		"target_backend: codex",
+		"internal_target_adapter: codex_exec",
+		"evaluator_backend: codex",
+		"backend_config_status: codex_no_azure_or_openai_required",
+		"optimizer_lock: acquired",
+		"recovery_available: true",
+		"optimizer_dry_run: true",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("train continue codex backend stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("optimizer calls = %+v, want one", runner.calls)
+	}
+	call := runner.calls[0]
+	for _, want := range []string{
+		"--optimizer-backend", "codex",
+		"--target-backend", "codex_exec",
+		"--evaluator-backend", "codex",
+		"--evaluator-id", "landing_page_v1",
+		"--dry-run",
+	} {
+		if !containsString(call.args, want) {
+			t.Fatalf("optimizer args missing %q: %+v", want, call.args)
+		}
+	}
+}
+
+func TestSkillOptTrainContinueBackendCodexRejectsConflictingAdvancedBackend(t *testing.T) {
+	home, _ := seedSkillOptTrainFeedbackSynced(t)
+	runner := &skillOptTrainFakeOptimizerRunner{}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--backend", "codex",
+		"--optimizer-backend", "openai_chat",
+		"--dry-run",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue conflict exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--backend codex conflicts with --optimizer-backend") {
+		t.Fatalf("conflict stderr = %q", stderr.String())
+	}
+	for _, unwanted := range []string{
+		"training_package:",
+		"optimizer_backend:",
+		"optimizer_lock:",
+	} {
+		if strings.Contains(stdout.String(), unwanted) {
+			t.Fatalf("conflict stdout included optimizer report field %q:\n%s", unwanted, stdout.String())
+		}
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("optimizer started despite backend conflict: %+v", runner.calls)
+	}
+}
+
+func TestResolveSkillOptTrainBackendRequestReportsDefaultOpenAIBackends(t *testing.T) {
+	_, resolution, err := resolveSkillOptTrainBackendRequest(skillOptTrainOptimizerRequest{
+		TargetBackend: "codex_exec",
+	})
+	if err != nil {
+		t.Fatalf("resolveSkillOptTrainBackendRequest returned error: %v", err)
+	}
+	if resolution.Backend != "custom" ||
+		resolution.OptimizerBackend != "openai_chat" ||
+		resolution.TargetBackend != "codex" ||
+		resolution.InternalTargetAdapter != "codex_exec" ||
+		resolution.EvaluatorBackend != "openai_chat" ||
+		resolution.ConfigStatus != "external_credentials_may_be_required" {
+		t.Fatalf("resolution = %+v", resolution)
+	}
+}
+
 func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
 	outRoot := filepath.Join(t.TempDir(), "optimizer")
@@ -4343,6 +4458,19 @@ func TestSkillOptTrainContinueRecordsOptimizerFailureAtPackageGate(t *testing.T)
 	if !strings.Contains(stderr.String(), "optimizer failed") || !strings.Contains(stderr.String(), "optimizer stderr") {
 		t.Fatalf("optimizer failure stderr = %q", stderr.String())
 	}
+	for _, want := range []string{
+		"backend: custom",
+		"optimizer_backend: openai_chat",
+		"target_backend: openai_chat",
+		"evaluator_backend: openai_chat",
+		"backend_config_status: external_credentials_may_be_required",
+		"optimizer_lock: acquired",
+		"recovery_available: false",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("optimizer failure stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
 
 	store := openCLIJobStore(t, home)
 	defer store.Close()
@@ -4406,6 +4534,50 @@ func TestSkillOptTrainContinueRecordsOptimizerFailureAtPackageGate(t *testing.T)
 	}
 }
 
+func TestSkillOptTrainContinueReportsRecoveryAfterOptimizerFailureArtifacts(t *testing.T) {
+	home, baseVersionID := seedSkillOptTrainFeedbackSynced(t)
+	outRoot := filepath.Join(t.TempDir(), "optimizer")
+	runner := &skillOptTrainFakeOptimizerRunner{
+		candidate:          cliSkillOptCandidatePackage(t, "planner", baseVersionID, "Plan with recoverable candidate guidance."),
+		failAfterCandidate: true,
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+		"--out-root", outRoot,
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue failing optimizer exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "optimizer stderr after candidate") {
+		t.Fatalf("optimizer failure stderr = %q", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "recovery_available: true") {
+		t.Fatalf("optimizer failure stdout did not report recovery:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(filepath.Join(outRoot, "candidate.json")); err != nil {
+		t.Fatalf("candidate package was not written before failure: %v", err)
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateTrainingPackageCreated || iteration.CandidateVersionID != "" {
+		t.Fatalf("iteration after recoverable optimizer failure = %+v", iteration)
+	}
+}
+
 func TestSkillOptTrainContinueRecordsOptimizerSetupFailure(t *testing.T) {
 	home, _ := seedSkillOptTrainFeedbackSynced(t)
 	runner := &skillOptTrainFakeOptimizerRunner{}
@@ -4427,6 +4599,19 @@ func TestSkillOptTrainContinueRecordsOptimizerSetupFailure(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `optimizer gate "unsupported" is not supported`) {
 		t.Fatalf("invalid gate stderr = %q", stderr.String())
+	}
+	for _, want := range []string{
+		"backend: custom",
+		"optimizer_backend: openai_chat",
+		"target_backend: openai_chat",
+		"evaluator_backend: openai_chat",
+		"backend_config_status: external_credentials_may_be_required",
+		"optimizer_lock: acquired",
+		"optimizer_command: -",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("optimizer setup failure stdout missing %q:\n%s", want, stdout.String())
+		}
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("optimizer ran after setup failure: %+v", runner.calls)
@@ -5478,6 +5663,9 @@ func TestSkillOptReviewCreateAndStatus(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "gitmoot skillopt review create") || !strings.Contains(stdout.String(), "gitmoot skillopt review status") {
 		t.Fatalf("skillopt help missing review commands:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "gitmoot skillopt train continue --session <id> [--backend codex]") {
+		t.Fatalf("skillopt help missing train backend preset:\n%s", stdout.String())
 	}
 
 	stdout.Reset()
@@ -6847,10 +7035,11 @@ func seedSkillOptTrainFeedbackSynced(t *testing.T) (string, string) {
 }
 
 type skillOptTrainFakeOptimizerRunner struct {
-	candidate     skillopt.CandidatePackage
-	fail          bool
-	lookPathValue string
-	calls         []skillOptTrainFakeOptimizerCall
+	candidate          skillopt.CandidatePackage
+	fail               bool
+	failAfterCandidate bool
+	lookPathValue      string
+	calls              []skillOptTrainFakeOptimizerCall
 }
 
 type skillOptTrainFakeOptimizerCall struct {
@@ -6862,7 +7051,7 @@ type skillOptTrainFakeOptimizerCall struct {
 func (r *skillOptTrainFakeOptimizerRunner) Run(_ context.Context, dir string, command string, args ...string) (subprocess.Result, error) {
 	r.calls = append(r.calls, skillOptTrainFakeOptimizerCall{dir: dir, command: command, args: append([]string{}, args...)})
 	result := subprocess.Result{Command: command, Args: args}
-	if r.fail {
+	if r.fail && !r.failAfterCandidate {
 		result.Stderr = "optimizer stderr"
 		return result, errors.New("exit status 2")
 	}
@@ -6906,6 +7095,10 @@ func (r *skillOptTrainFakeOptimizerRunner) Run(_ context.Context, dir string, co
 		return result, err
 	}
 	result.Stdout = "wrote candidate package: " + candidateOutput + "\n"
+	if r.failAfterCandidate {
+		result.Stderr = "optimizer stderr after candidate"
+		return result, errors.New("exit status 2")
+	}
 	return result, nil
 }
 

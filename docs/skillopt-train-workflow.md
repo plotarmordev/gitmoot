@@ -234,6 +234,7 @@ returns unchanged baseline content, Gitmoot records
 gitmoot skillopt train continue \
   --session planner-train \
   --skillopt-bin /path/to/gitmoot-skillopt \
+  --backend codex \
   --out-root .gitmoot/skillopt/planner-train \
   --dry-run
 ```
@@ -246,10 +247,8 @@ gitmoot skillopt train continue \
   --session landing-page-train \
   --skillopt-bin /path/to/gitmoot-skillopt \
   --out-root .gitmoot/skillopt/landing-page-train \
-  --optimizer-backend openai_chat \
-  --target-backend codex_exec \
+  --backend codex \
   --evaluator-id landing_page_v1 \
-  --evaluator-backend openai_chat \
   --optimizer-model gpt-5.5 \
   --target-model gpt-5.5 \
   --evaluator-model gpt-5.5 \
@@ -259,14 +258,19 @@ gitmoot skillopt train continue \
   --gate mixed
 ```
 
-Before training starts, `gitmoot-skillopt` preflights the optimizer, target, and
-evaluator. The canaries must prove the target can return the exact requested
-text and that the evaluator can return structured hard/soft JSON. Optimizer
-failures record blocked status and do not promote or partially install
-candidate templates. If the optimizer selects the unchanged baseline, accepts no
-prompt edit, or returns content with the same hash as the base template, Gitmoot
-records `optimizer_completed_no_candidate` with `no_candidate_reason` and does
-not create or publish a pending candidate review.
+`--backend codex` resolves the user-facing optimizer, evaluator, and target
+provider to `codex`; Gitmoot passes the internal SkillOpt target adapter as
+`codex_exec`, so users do not need to remember that implementation detail.
+Before training starts, `train continue` prints the resolved backend report,
+config status, optimizer lock state, and recovery availability. Then
+`gitmoot-skillopt` preflights the optimizer, target, and evaluator. The
+canaries must prove the target can return the exact requested text and that the
+evaluator can return structured hard/soft JSON. Optimizer failures record
+blocked status and do not promote or partially install candidate templates. If
+the optimizer selects the unchanged baseline, accepts no prompt edit, or returns
+content with the same hash as the base template, Gitmoot records
+`optimizer_completed_no_candidate` with `no_candidate_reason` and does not
+create or publish a pending candidate review.
 
 ## Candidate Review And Next Iteration
 
