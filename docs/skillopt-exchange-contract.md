@@ -471,7 +471,7 @@ Complete train-mode path:
 3. `gitmoot skillopt train continue --session <session-id>` to generate options and publish the review packet.
 4. Human feedback is imported from raw or fenced YAML comments; `train continue` auto-syncs GitHub comments when the review is published and feedback is missing.
 5. Evaluator profiles run cheap artifact checks first, optional render adapters second, and LLM judges last. Structured failures flow into optimizer input with reasons, hints, evidence, failed checks, and stage status.
-6. `gitmoot skillopt train continue --session <session-id>` to export the package, run `gitmoot-skillopt`, and import the pending candidate, or record `optimizer_completed_no_candidate` if the optimizer produced no promotable content.
+6. `gitmoot skillopt train continue --session <session-id> --backend codex` to export the package, print the resolved backend/preflight report, run `gitmoot-skillopt`, and import the pending candidate, or record `optimizer_completed_no_candidate` if the optimizer produced no promotable content.
 7. `gitmoot skillopt train continue --session <session-id>` to publish candidate review context with separate selection score, evaluator/test scores, gate status, no-op status, and promotability.
 8. `gitmoot skillopt train continue --session <session-id> --promote <version>` or `--reject <version> --reason <text>`.
 9. `gitmoot skillopt train continue --session <session-id> --start-next` only after the prior iteration is resolved.
