@@ -5669,8 +5669,17 @@ func printSkillOptNoCandidateDetails(stdout io.Writer, details map[string]any) {
 	if retryStopReasons := metadataStringSlice(details, "retry_stop_reasons"); len(retryStopReasons) > 0 {
 		writeLine(stdout, "retry_stop_reasons: %s", strings.Join(retryStopReasons, ","))
 	}
+	if reviewFeedbackItems := metadataStringSlice(details, "review_feedback_items"); len(reviewFeedbackItems) > 0 {
+		writeLine(stdout, "review_feedback_items: %s", strings.Join(reviewFeedbackItems, ","))
+	}
 	if optimizerContextItems := metadataStringSlice(details, "optimizer_context_items"); len(optimizerContextItems) > 0 {
 		writeLine(stdout, "optimizer_context_items: %s", strings.Join(optimizerContextItems, ","))
+	}
+	if selectionFailedItem := metadataString(details, "selection_failed_item"); selectionFailedItem != "" {
+		writeLine(stdout, "selection_failed_item: %s", selectionFailedItem)
+	}
+	if retryDecision := metadataString(details, "retry_decision"); retryDecision != "" {
+		writeLine(stdout, "retry_decision: %s", retryDecision)
 	}
 	if scoreGap := metadataString(details, "score_gap"); scoreGap != "" {
 		writeLine(stdout, "score_gap: %s", scoreGap)

@@ -3250,7 +3250,10 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 			"selection_gate_relation": "candidate_below_baseline",
 				"retry_budget_exhausted": true,
 				"retry_stop_reasons": ["budget_exhausted"],
+				"review_feedback_items": ["item-001", "item-002"],
 				"optimizer_context_items": ["item-001", "item-002"],
+				"selection_failed_item": "item-001",
+				"retry_decision": "budget_exhausted",
 				"score_gap": 0.05,
 				"score_gap_handling": "retry_context",
 				"hard_score_handling": "retryable_if_actionable",
@@ -3366,7 +3369,10 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		!strings.Contains(iteration.MetadataJSON, `"duplicate_retry_detected":true`) ||
 		!strings.Contains(iteration.MetadataJSON, `"evaluator_reason":"Candidate was valid but had weaker imagery."`) ||
 		!strings.Contains(iteration.MetadataJSON, `"optimizer_hint":"Resolve imported review themes and artifact contract."`) ||
+		!strings.Contains(iteration.MetadataJSON, `"review_feedback_items":["item-001","item-002"]`) ||
 		!strings.Contains(iteration.MetadataJSON, `"optimizer_context_items":["item-001","item-002"]`) ||
+		!strings.Contains(iteration.MetadataJSON, `"selection_failed_item":"item-001"`) ||
+		!strings.Contains(iteration.MetadataJSON, `"retry_decision":"budget_exhausted"`) ||
 		!strings.Contains(iteration.MetadataJSON, `"score_gap_handling":"retry_context"`) ||
 		!strings.Contains(iteration.MetadataJSON, `"hard_score_handling":"retryable_if_actionable"`) ||
 		!strings.Contains(iteration.MetadataJSON, `"source_item_ids":["item-001"]`) {
@@ -3398,6 +3404,8 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		statusJSON.NoCandidateDetails["duplicate_retry_detected"] != true ||
 		statusJSON.NoCandidateDetails["selection_gate_relation"] != "candidate_below_baseline" ||
 		statusJSON.NoCandidateDetails["retry_budget_exhausted"] != true ||
+		statusJSON.NoCandidateDetails["selection_failed_item"] != "item-001" ||
+		statusJSON.NoCandidateDetails["retry_decision"] != "budget_exhausted" ||
 		statusJSON.NoCandidateDetails["score_gap_handling"] != "retry_context" ||
 		statusJSON.NoCandidateDetails["hard_score_handling"] != "retryable_if_actionable" ||
 		statusJSON.NoCandidateDetails["optimizer_hint"] != "Resolve imported review themes and artifact contract." ||
@@ -3435,7 +3443,10 @@ func TestSkillOptTrainContinueRecordsNoCandidateResult(t *testing.T) {
 		"selection_gate_relation: candidate_below_baseline",
 		"retry_budget_exhausted: true",
 		"retry_stop_reasons: budget_exhausted",
+		"review_feedback_items: item-001,item-002",
 		"optimizer_context_items: item-001,item-002",
+		"selection_failed_item: item-001",
+		"retry_decision: budget_exhausted",
 		"score_gap: 0.05",
 		"score_gap_handling: retry_context",
 		"hard_score_handling: retryable_if_actionable",

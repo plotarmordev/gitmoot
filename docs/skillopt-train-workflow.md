@@ -418,13 +418,25 @@ gitmoot skillopt train status --session planner-train --verbose
 ```
 
 For gate rejections, status includes the baseline/candidate score comparison,
-attempted patch, retry count such as `1/3`, optimizer context items, duplicate
-retry detection, score-gap handling, hard-score handling, evaluator reason, and
-concise `next_action_option` lines. The normal user choices are to collect more
-feedback, rerun after changing the retry/config inputs, or inspect the candidate
-package manually. Gitmoot does not create a pending candidate record when the
-best selected prompt is the unchanged baseline or the candidate content hash
-matches the base template.
+attempted patch, retry count such as `1/3`, reviewed feedback items, optimizer
+context items, selection failed item, retry decision, duplicate retry detection,
+score-gap handling, hard-score handling, evaluator reason, and concise
+`next_action_option` lines. Example fields:
+
+```text
+review_feedback_items: item-001,item-002
+optimizer_context_items: item-001,item-002
+selection_failed_item: item-001
+retry_decision: retry
+score_gap: 0.705
+score_gap_handling: retry_context
+hard_score_handling: retryable_if_actionable
+```
+
+The normal user choices are to collect more feedback, rerun after changing the
+retry/config inputs, or inspect the candidate package manually. Gitmoot does
+not create a pending candidate record when the best selected prompt is the
+unchanged baseline or the candidate content hash matches the base template.
 
 ```mermaid
 flowchart TD
