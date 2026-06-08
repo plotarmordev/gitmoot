@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -250,6 +251,64 @@ func TestRunGoalImportPreservesExistingTaskProgress(t *testing.T) {
 	}
 }
 
+func TestRunTaskList(t *testing.T) {
+	home := t.TempDir()
+	goalPath := filepath.Join(t.TempDir(), "GOAL.md")
+	writeFile(t, goalPath, "# Build Gitmoot\n\n### Task 1: Bootstrap\n\n### Task 2: Review\n")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"goal", "import", "--home", home, "--file", goalPath, "--repo", "plotarmordev/gitmoot"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("goal import exit code = %d, stderr=%s", code, stderr.String())
+	}
+	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := store.UpsertTask(context.Background(), db.Task{
+		ID:           "task-001",
+		RepoFullName: "plotarmordev/gitmoot",
+		GoalID:       "goal",
+		Title:        "Bootstrap",
+		State:        "implementing",
+		Branch:       "task-001-bootstrap",
+		WorktreePath: "/tmp/gitmoot/worktrees/jerryfane--gitmoot/task-001",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"task", "list", "--home", home, "--repo", "plotarmordev/gitmoot", "--state", "implementing"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("task list exit code = %d, stderr=%s", code, stderr.String())
+	}
+	output := stdout.String()
+	if !strings.Contains(output, "task-001\timplementing\tplotarmordev/gitmoot\ttask-001-bootstrap\t/tmp/gitmoot/worktrees/jerryfane--gitmoot/task-001\tBootstrap") {
+		t.Fatalf("task list output = %q", output)
+	}
+	if strings.Contains(output, "task-002") {
+		t.Fatalf("task list did not apply state filter:\n%s", output)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"task", "list", "--home", home, "--repo", "plotarmordev/gitmoot", "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("task list --json exit code = %d, stderr=%s", code, stderr.String())
+	}
+	var decoded []taskListOutput
+	if err := json.Unmarshal(stdout.Bytes(), &decoded); err != nil {
+		t.Fatalf("json output did not decode: %v\n%s", err, stdout.String())
+	}
+	if len(decoded) != 2 || decoded[0].ID != "task-001" || decoded[0].WorktreePath == "" {
+		t.Fatalf("decoded = %+v", decoded)
+	}
+}
+
 func TestRunGoalImportRollsBackOnTaskFailure(t *testing.T) {
 	home := t.TempDir()
 	var stdout, stderr bytes.Buffer
@@ -382,6 +441,9 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/plotarmordev/gitmoot.git")
+	writeFile(t, filepath.Join(repoDir, "README.md"), "smoke\n")
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "-c", "user.name=Gitmoot Test", "-c", "user.email=gitmoot@example.com", "commit", "-m", "initial")
 	withWorkingDirectory(t, repoDir)
 
 	stdout.Reset()
@@ -389,6 +451,9 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	code = Run([]string{"task", "run", "task-001", "--home", home, "--repo", "plotarmordev/gitmoot", "--owner", "lead"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("task run exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "worktree: ") {
+		t.Fatalf("stdout missing worktree path: %q", stdout.String())
 	}
 
 	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
@@ -402,6 +467,30 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	}
 	if repo.CheckoutPath != repoDir || repo.RemoteURL != "https://github.com/plotarmordev/gitmoot.git" {
 		t.Fatalf("repo = %+v", repo)
+	}
+	task, err := store.GetTask(context.Background(), "task-001")
+	if err != nil {
+		t.Fatalf("GetTask returned error: %v", err)
+	}
+	wantWorktree := filepath.Join(home, ".gitmoot", "worktrees", "jerryfane--gitmoot", "task-001")
+	if task.State != "implementing" || task.Branch != "task-001-bootstrap" || task.WorktreePath != wantWorktree {
+		t.Fatalf("task = %+v, want implementing task-001-bootstrap at %s", task, wantWorktree)
+	}
+	lock, err := store.GetBranchLock(context.Background(), "plotarmordev/gitmoot", "task-001-bootstrap")
+	if err != nil {
+		t.Fatalf("GetBranchLock returned error: %v", err)
+	}
+	if lock.Owner != "lead" {
+		t.Fatalf("branch lock owner = %q, want lead", lock.Owner)
+	}
+	if _, err := os.Stat(wantWorktree); err != nil {
+		t.Fatalf("worktree path was not created: %v", err)
+	}
+	if currentBranch := strings.TrimSpace(runGitOutput(t, repoDir, "branch", "--show-current")); currentBranch != "main" {
+		t.Fatalf("main checkout branch = %q, want main", currentBranch)
+	}
+	if worktreeBranch := strings.TrimSpace(runGitOutput(t, wantWorktree, "branch", "--show-current")); worktreeBranch != "task-001-bootstrap" {
+		t.Fatalf("task worktree branch = %q, want task-001-bootstrap", worktreeBranch)
 	}
 }
 
@@ -420,6 +509,9 @@ func TestRunTaskRunBlocksWhenCheckoutMutationLocked(t *testing.T) {
 	runGit(t, repoDir, "init")
 	runGit(t, repoDir, "branch", "-m", "main")
 	runGit(t, repoDir, "remote", "add", "origin", "https://github.com/plotarmordev/gitmoot.git")
+	writeFile(t, filepath.Join(repoDir, "README.md"), "smoke\n")
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "-c", "user.name=Gitmoot Test", "-c", "user.email=gitmoot@example.com", "commit", "-m", "initial")
 	withWorkingDirectory(t, repoDir)
 
 	store, err := db.Open(filepath.Join(home, ".gitmoot", "gitmoot.db"))
@@ -455,6 +547,10 @@ func TestRunTaskRunBlocksWhenCheckoutMutationLocked(t *testing.T) {
 	branches := runGitOutput(t, repoDir, "branch", "--list", "task-001")
 	if strings.TrimSpace(branches) != "" {
 		t.Fatalf("task branch was created despite checkout lock: %q", branches)
+	}
+	worktreePath := filepath.Join(home, ".gitmoot", "worktrees", "jerryfane--gitmoot", "task-001")
+	if _, err := os.Stat(worktreePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worktree path after checkout lock error = %v, want os.ErrNotExist", err)
 	}
 }
 

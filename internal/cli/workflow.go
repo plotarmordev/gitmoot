@@ -18,6 +18,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/plotarmordev/gitmoot/internal/config"
 	"github.com/plotarmordev/gitmoot/internal/daemon"
 	"github.com/plotarmordev/gitmoot/internal/db"
 	gitutil "github.com/plotarmordev/gitmoot/internal/git"
@@ -241,17 +242,98 @@ func runTask(args []string, stdout, stderr io.Writer) int {
 		printTaskUsage(stdout)
 		return 0
 	}
-	if args[0] != "run" {
+	switch args[0] {
+	case "run":
+		return runTaskRun(args[1:], stdout, stderr)
+	case "list":
+		return runTaskList(args[1:], stdout, stderr)
+	default:
 		fmt.Fprintf(stderr, "unknown task command %q\n\n", args[0])
 		printTaskUsage(stderr)
 		return 2
 	}
-	return runTaskRun(args[1:], stdout, stderr)
 }
 
 func printTaskUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  gitmoot task run <id> --repo owner/repo --owner <agent> [--branch <branch>] [--base <branch>]")
+	fmt.Fprintln(w, "  gitmoot task list [--repo owner/repo] [--state state] [--json]")
+}
+
+type taskListOutput struct {
+	ID           string `json:"id"`
+	Repo         string `json:"repo"`
+	GoalID       string `json:"goal_id"`
+	Title        string `json:"title"`
+	State        string `json:"state"`
+	Branch       string `json:"branch"`
+	WorktreePath string `json:"worktree_path"`
+}
+
+func runTaskList(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("task list", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	repo := fs.String("repo", "", "repo scope as owner/repo")
+	state := fs.String("state", "", "task state filter")
+	jsonOutput := fs.Bool("json", false, "print tasks as JSON")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "task list does not accept positional arguments")
+		return 2
+	}
+	if strings.TrimSpace(*repo) != "" {
+		if _, err := normalizeRepoFlag(*repo); err != nil {
+			fmt.Fprintf(stderr, "invalid repo: %v\n", err)
+			return 2
+		}
+	}
+
+	var tasks []db.Task
+	if err := withStore(*home, func(store *db.Store) error {
+		var err error
+		if strings.TrimSpace(*repo) != "" {
+			tasks, err = store.ListTasksByRepo(context.Background(), strings.TrimSpace(*repo))
+		} else {
+			tasks, err = store.ListTasks(context.Background())
+		}
+		return err
+	}); err != nil {
+		fmt.Fprintf(stderr, "task list: %v\n", err)
+		return 1
+	}
+	outputs := make([]taskListOutput, 0, len(tasks))
+	stateFilter := strings.TrimSpace(*state)
+	for _, task := range tasks {
+		if stateFilter != "" && task.State != stateFilter {
+			continue
+		}
+		outputs = append(outputs, taskListOutput{
+			ID:           task.ID,
+			Repo:         task.RepoFullName,
+			GoalID:       task.GoalID,
+			Title:        task.Title,
+			State:        task.State,
+			Branch:       task.Branch,
+			WorktreePath: task.WorktreePath,
+		})
+	}
+	if *jsonOutput {
+		if err := writeJSON(stdout, outputs); err != nil {
+			fmt.Fprintf(stderr, "task list: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	for _, task := range outputs {
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%s\t%s\n", task.ID, task.State, task.Repo, task.Branch, task.WorktreePath, task.Title)
+	}
+	return 0
 }
 
 func runTaskRun(args []string, stdout, stderr io.Writer) int {
@@ -261,7 +343,7 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 	repo := fs.String("repo", "", "repo scope as owner/repo")
 	owner := fs.String("owner", "", "agent that will hold the branch lock")
 	branch := fs.String("branch", "", "task branch name")
-	base := fs.String("base", "", "base branch for git switch -c")
+	base := fs.String("base", "", "base branch for git worktree add")
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fs.Usage()
 		if len(args) == 0 {
@@ -287,7 +369,7 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 	}
 
 	var started db.Task
-	if err := withStore(*home, func(store *db.Store) error {
+	if err := withStoreAndPaths(*home, func(paths config.Paths, store *db.Store) error {
 		task, err := store.GetTask(context.Background(), taskID)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -316,7 +398,8 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		checkout := repoRecord.CheckoutPath
 		requestBranch := firstNonEmpty(*branch, task.Branch, task.ID)
 		engine := workflow.Engine{Store: store}
-		started, err = engine.StartTaskBranch(context.Background(), workflow.TaskBranchRequest{
+		started, err = engine.AllocateTaskWorktree(context.Background(), workflow.TaskWorktreeRequest{
+			Home:       paths.Home,
 			Repo:       requestRepo,
 			GoalID:     task.GoalID,
 			TaskID:     task.ID,
@@ -332,6 +415,9 @@ func runTaskRun(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	fmt.Fprintf(stdout, "started %s on %s\n", started.ID, started.Branch)
+	if strings.TrimSpace(started.WorktreePath) != "" {
+		fmt.Fprintf(stdout, "worktree: %s\n", started.WorktreePath)
+	}
 	return 0
 }
 
