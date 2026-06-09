@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/plotarmordev/gitmoot/internal/db"
+	"github.com/plotarmordev/gitmoot/internal/workflow"
 )
 
 func TestRunGoalImportAndStatus(t *testing.T) {
@@ -606,6 +607,51 @@ func TestRunTaskRunRegistersCurrentRepo(t *testing.T) {
 	}
 	if !foundFreshQueued {
 		t.Fatalf("jobs = %+v, want fresh queued rerun job", jobs)
+	}
+}
+
+func TestTaskRunJobMatchesDelegatedImplementJob(t *testing.T) {
+	payload, err := json.Marshal(workflow.JobPayload{
+		Repo:             "plotarmordev/gitmoot",
+		Branch:           "task-001-bootstrap",
+		HeadSHA:          "head123",
+		GoalID:           "goal-1",
+		TaskID:           "task-001",
+		TaskTitle:        "Bootstrap",
+		LeadAgent:        "lead",
+		Sender:           "task run",
+		Instructions:     "Implement task task-001: Bootstrap.",
+		OriginalAgent:    "lead",
+		DelegatedAgent:   "lead-temp-task-001",
+		DelegationReason: "runtime_session_busy",
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal returned error: %v", err)
+	}
+	job := db.Job{
+		ID:      "task-task-001-implement-lead",
+		Agent:   "lead-temp-task-001",
+		Type:    "implement",
+		State:   string(workflow.JobQueued),
+		Payload: string(payload),
+	}
+	request := workflow.JobRequest{
+		ID:           "task-task-001-implement-lead",
+		Agent:        "lead",
+		Action:       "implement",
+		Repo:         "plotarmordev/gitmoot",
+		Branch:       "task-001-bootstrap",
+		HeadSHA:      "head123",
+		GoalID:       "goal-1",
+		TaskID:       "task-001",
+		TaskTitle:    "Bootstrap",
+		LeadAgent:    "lead",
+		Sender:       "task run",
+		Instructions: "Implement task task-001: Bootstrap.",
+	}
+
+	if !taskRunJobMatchesRequest(job, request) {
+		t.Fatalf("taskRunJobMatchesRequest returned false for delegated task-run job")
 	}
 }
 
