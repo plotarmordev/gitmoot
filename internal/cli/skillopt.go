@@ -2181,6 +2181,62 @@ type skillOptTrainOptimizerRequest struct {
 	OptimizerLockState           string
 }
 
+const skillOptTrainSkillOptWheelURL = "https://github.com/plotarmordev/gitmoot-skillopt/releases/download/v0.2.0b1/gitmoot_skillopt-0.2.0b1-py3-none-any.whl"
+
+type skillOptTrainOptimizerPreflightError struct {
+	Executable string
+	Step       string
+	Result     subprocess.Result
+	Err        error
+}
+
+func (e skillOptTrainOptimizerPreflightError) Error() string {
+	executable := strings.TrimSpace(e.Executable)
+	if executable == "" {
+		executable = "gitmoot-skillopt"
+	}
+	step := strings.TrimSpace(e.Step)
+	if step == "" {
+		step = "preflight"
+	}
+	details := ""
+	if e.Err != nil {
+		details = ": " + e.Err.Error()
+	}
+	if diag := subprocessDiagnostics(e.Result); diag != "" {
+		details += diag
+	}
+	return fmt.Sprintf(
+		"gitmoot-skillopt is required for optimizer-backed train continue; %s failed for %q%s\n\n%s",
+		step,
+		executable,
+		details,
+		skillOptTrainSkillOptInstallHint(),
+	)
+}
+
+func (e skillOptTrainOptimizerPreflightError) Unwrap() error {
+	return e.Err
+}
+
+func skillOptTrainSkillOptInstallNextAction() string {
+	return "install gitmoot-skillopt and rerun train continue"
+}
+
+func skillOptTrainSkillOptInstallHint() string {
+	return "Install with pipx:\n" +
+		"  python3 -m pip install --user pipx\n" +
+		"  python3 -m pipx ensurepath\n" +
+		"  pipx install " + skillOptTrainSkillOptWheelURL + "\n" +
+		"  gitmoot-skillopt --version\n" +
+		"  gitmoot-skillopt optimize --help\n\n" +
+		"If pipx is unavailable, use a venv and pass --skillopt-bin:\n" +
+		"  python3 -m venv ~/.gitmoot/skillopt-venv\n" +
+		"  ~/.gitmoot/skillopt-venv/bin/python -m pip install --upgrade pip\n" +
+		"  ~/.gitmoot/skillopt-venv/bin/python -m pip install " + skillOptTrainSkillOptWheelURL + "\n" +
+		"  gitmoot skillopt train continue --session <id> --skillopt-bin ~/.gitmoot/skillopt-venv/bin/gitmoot-skillopt"
+}
+
 type skillOptTrainContinueOutput struct {
 	Summary       skillopt.TrainStatusSummary
 	Counts        skillopt.TrainStatusCounts
@@ -2484,6 +2540,15 @@ func continueSkillOptTrain(ctx context.Context, paths config.Paths, store *db.St
 			summary.CurrentPhase != skillopt.TrainStateOptimizerCompletedNoCandidate {
 			output.Lines = []string{fmt.Sprintf("next: %s", summary.NextAction)}
 			return output, nil
+		}
+		if skillOptTrainContinueNeedsOptimizerPreflight(summary.CurrentPhase, request.Optimizer) {
+			result, err := preflightSkillOptTrainOptimizerForContinue(ctx, paths, store, session, *iteration, request.Optimizer)
+			if err != nil {
+				if skillOptTrainOptimizerResultHasReport(result) {
+					output.Lines = skillOptTrainOptimizerReportLines(result)
+				}
+				return output, err
+			}
 		}
 		result, err := continueSkillOptTrainOptimizer(ctx, paths, store, session, *iteration, request.Optimizer, request.Progress)
 		if err != nil {
@@ -2792,6 +2857,7 @@ type skillOptTrainOptimizerResult struct {
 	CandidateVersionID    string
 	NoCandidateReason     string
 	NoCandidateNextAction string
+	NextAction            string
 	ExportedOnly          bool
 }
 
@@ -4515,6 +4581,59 @@ func skillOptTrainNextIterationMode(previousMode string, recommendedMode string)
 	default:
 		return strings.TrimSpace(previousMode)
 	}
+}
+
+func skillOptTrainContinueNeedsOptimizerPreflight(phase string, request skillOptTrainOptimizerRequest) bool {
+	if request.ExportOnly {
+		return false
+	}
+	switch strings.TrimSpace(phase) {
+	case skillopt.TrainStateFeedbackSynced, skillopt.TrainStateTrainingPackageCreated:
+		return true
+	case skillopt.TrainStateOptimizerCompleted, skillopt.TrainStateOptimizerCompletedNoCandidate:
+		return request.RerunOptimizer
+	default:
+		return false
+	}
+}
+
+func preflightSkillOptTrainOptimizerForContinue(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest) (skillOptTrainOptimizerResult, error) {
+	resolvedRequest, backendResolution, err := resolveSkillOptTrainBackendRequest(request)
+	if err != nil {
+		return skillOptTrainOptimizerResult{}, err
+	}
+	request = resolvedRequest
+	optimizerPaths, err := resolveSkillOptTrainOptimizerPaths(paths, session, iteration, request)
+	if err != nil {
+		return skillOptTrainOptimizerResult{}, err
+	}
+	result := skillOptTrainOptimizerResult{
+		TrainingPackagePath:  optimizerPaths.TrainingPackagePath,
+		OutRoot:              optimizerPaths.OutRoot,
+		CandidatePackagePath: optimizerPaths.CandidatePackagePath,
+		ArtifactDir:          optimizerPaths.ArtifactDir,
+		OptimizerRoot:        optimizerPaths.OptimizerRoot,
+		OptimizerAttempt:     optimizerPaths.OptimizerAttempt,
+		OptimizerAttemptPath: optimizerPaths.OptimizerAttemptPath,
+		Command:              skillOptTrainOptimizerExecutable(request),
+		DryRun:               request.DryRun,
+		Request:              request,
+		BackendResolution:    backendResolution,
+		RecoveryAvailable:    skillOptTrainOptimizerRecoveryAvailable(optimizerPaths),
+		OptimizerLockState:   skillOptTrainOptimizerLockState(request),
+	}
+	command, preflightResult, err := preflightSkillOptTrainOptimizerExecutable(ctx, request)
+	if strings.TrimSpace(command) != "" {
+		result.Command = command
+	}
+	if err != nil {
+		result.NextAction = skillOptTrainSkillOptInstallNextAction()
+		if metaErr := recordSkillOptTrainOptimizerFailure(ctx, store, session, iteration, request, optimizerPaths, result.Command, nil, preflightResult, err); metaErr != nil {
+			return result, fmt.Errorf("%w; failed to record optimizer failure: %v", err, metaErr)
+		}
+		return result, err
+	}
+	return result, nil
 }
 
 func continueSkillOptTrainOptimizer(ctx context.Context, paths config.Paths, store *db.Store, session db.SkillOptTrainSession, iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest, progress io.Writer) (skillOptTrainOptimizerResult, error) {
@@ -7018,7 +7137,7 @@ func skillOptStatusFailureLooksConfigBlocked(metadata map[string]any) bool {
 		return false
 	}
 	errorText := strings.ToLower(metadataString(metadata, "error"))
-	for _, marker := range []string{"config", "credential", "api key", "openai", "azure", "backend"} {
+	for _, marker := range []string{"config", "credential", "api key", "openai", "azure", "backend", "gitmoot-skillopt", "executable", "not found", "install", "path"} {
 		if strings.Contains(errorText, marker) {
 			return true
 		}
@@ -8829,25 +8948,69 @@ func isCodexFamilyBackend(backend string) bool {
 	}
 }
 
+func skillOptTrainOptimizerExecutable(request skillOptTrainOptimizerRequest) string {
+	executable := strings.TrimSpace(request.SkillOptBin)
+	if executable == "" {
+		executable = "gitmoot-skillopt"
+	}
+	return executable
+}
+
+func resolveSkillOptTrainOptimizerExecutable(request skillOptTrainOptimizerRequest) (string, error) {
+	executable := skillOptTrainOptimizerExecutable(request)
+	resolved, err := skillOptTrainOptimizerRunner.LookPath(executable)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(resolved) {
+		resolved, err = filepath.Abs(resolved)
+		if err != nil {
+			return "", fmt.Errorf("resolve gitmoot-skillopt executable %q: %w", resolved, err)
+		}
+	}
+	return resolved, nil
+}
+
+func preflightSkillOptTrainOptimizerExecutable(ctx context.Context, request skillOptTrainOptimizerRequest) (string, subprocess.Result, error) {
+	requested := skillOptTrainOptimizerExecutable(request)
+	resolved, err := resolveSkillOptTrainOptimizerExecutable(request)
+	if err != nil {
+		return requested, subprocess.Result{}, skillOptTrainOptimizerPreflightError{
+			Executable: requested,
+			Step:       "find executable",
+			Err:        err,
+		}
+	}
+	result, err := skillOptTrainOptimizerRunner.Run(ctx, "", resolved, "--version")
+	if err != nil {
+		return resolved, result, skillOptTrainOptimizerPreflightError{
+			Executable: resolved,
+			Step:       "version check",
+			Result:     result,
+			Err:        err,
+		}
+	}
+	result, err = skillOptTrainOptimizerRunner.Run(ctx, "", resolved, "optimize", "--help")
+	if err != nil {
+		return resolved, result, skillOptTrainOptimizerPreflightError{
+			Executable: resolved,
+			Step:       "optimize help check",
+			Result:     result,
+			Err:        err,
+		}
+	}
+	return resolved, result, nil
+}
+
 func buildSkillOptTrainOptimizerCommand(iteration db.SkillOptTrainIteration, request skillOptTrainOptimizerRequest, paths skillOptTrainOptimizerPaths) (string, []string, error) {
 	resolvedRequest, _, err := resolveSkillOptTrainBackendRequest(request)
 	if err != nil {
 		return "", nil, err
 	}
 	request = resolvedRequest
-	executable := strings.TrimSpace(request.SkillOptBin)
-	if executable == "" {
-		executable = "gitmoot-skillopt"
-	}
-	resolved, err := skillOptTrainOptimizerRunner.LookPath(executable)
+	resolved, err := resolveSkillOptTrainOptimizerExecutable(request)
 	if err != nil {
-		return "", nil, fmt.Errorf("find gitmoot-skillopt executable %q: %w", executable, err)
-	}
-	if !filepath.IsAbs(resolved) {
-		resolved, err = filepath.Abs(resolved)
-		if err != nil {
-			return "", nil, fmt.Errorf("resolve gitmoot-skillopt executable %q: %w", resolved, err)
-		}
+		return "", nil, fmt.Errorf("find gitmoot-skillopt executable %q: %w", skillOptTrainOptimizerExecutable(request), err)
 	}
 	gate, err := skillOptTrainOptimizerGate(iteration, request)
 	if err != nil {
@@ -9095,9 +9258,20 @@ func skillOptTrainOptimizerMetadata(request skillOptTrainOptimizerRequest, paths
 	}
 	if failure != nil {
 		metadata["error"] = failure.Error()
+		if nextAction := skillOptTrainOptimizerFailureNextAction(failure); nextAction != "" {
+			metadata["next_action"] = nextAction
+		}
 	}
 	addSkillOptTrainOptimizerConfigMetadata(metadata, request)
 	return metadata
+}
+
+func skillOptTrainOptimizerFailureNextAction(failure error) string {
+	var preflightErr skillOptTrainOptimizerPreflightError
+	if errors.As(failure, &preflightErr) {
+		return skillOptTrainSkillOptInstallNextAction()
+	}
+	return ""
 }
 
 func addSkillOptTrainOptimizerConfigMetadata(metadata map[string]any, request skillOptTrainOptimizerRequest) {
@@ -9550,6 +9724,9 @@ func skillOptTrainOptimizerReportLines(result skillOptTrainOptimizerResult) []st
 		lines = append(lines, fmt.Sprintf("hard_failure_retry_budget: %d", result.Request.HardFailureRetryBudget))
 	}
 	lines = append(lines, fmt.Sprintf("optimizer_dry_run: %t", result.DryRun))
+	if next := strings.TrimSpace(result.NextAction); next != "" {
+		lines = append(lines, fmt.Sprintf("next: %s", next))
+	}
 	return lines
 }
 

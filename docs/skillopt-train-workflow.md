@@ -388,6 +388,24 @@ to validate the package and optimizer command shape without model calls. If the
 dry-run returns unchanged baseline content, Gitmoot records
 `optimizer_completed_no_candidate` instead of publishing a candidate review.
 
+Before Gitmoot launches the optimizer, it checks the resolved
+`gitmoot-skillopt` executable with `--version` and `optimize --help`. If the
+binary is missing or its Python environment is broken, `train continue` stops
+without launching the optimizer, records the optimizer metadata as failed,
+reports `status_phase: blocked_config`, and prints the install hint. The
+recommended install path is:
+
+```sh
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+pipx install https://github.com/plotarmordev/gitmoot-skillopt/releases/download/v0.2.0b1/gitmoot_skillopt-0.2.0b1-py3-none-any.whl
+gitmoot-skillopt --version
+gitmoot-skillopt optimize --help
+```
+
+If `pipx` is unavailable, install the wheel in a venv and pass that executable
+with `--skillopt-bin /path/to/venv/bin/gitmoot-skillopt`.
+
 ```sh
 gitmoot skillopt train continue \
   --session planner-train \
@@ -716,7 +734,8 @@ Manual smoke scenarios for review operations:
   `active_lock` owner, pid, host, heartbeat, and expiry in verbose status before
   clearing stale state or retrying the optimizer.
 - Config blocker: if `status_phase` is `blocked_config`, fix the reported
-  backend, credential, or model configuration and rerun `train continue`.
+  `gitmoot-skillopt` install, backend, credential, or model configuration and
+  rerun `train continue`.
 - Render adapter unavailable: install the profile's render dependency or run a
   profile/config that does not require render smoke. Required render profiles
   fail before the LLM judge so the optimizer receives a structured blocker.

@@ -4380,6 +4380,147 @@ func TestSkillOptTrainContinueExportOnlyRejectsConflicts(t *testing.T) {
 	}
 }
 
+func TestSkillOptTrainContinueBlocksMissingOptimizerBinary(t *testing.T) {
+	home, _ := seedSkillOptTrainFeedbackSynced(t)
+	runner := &skillOptTrainFakeOptimizerRunner{
+		lookPathErr: errors.New("executable file not found in $PATH"),
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue missing optimizer exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if len(runner.preflightCalls) != 0 || len(runner.calls) != 0 {
+		t.Fatalf("optimizer should not run when binary lookup fails: preflight=%+v calls=%+v", runner.preflightCalls, runner.calls)
+	}
+	for _, want := range []string{
+		"optimizer_lock: acquired",
+		"optimizer_command: gitmoot-skillopt",
+		"next: install gitmoot-skillopt and rerun train continue",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("missing optimizer stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	for _, want := range []string{
+		"gitmoot-skillopt is required",
+		"find executable failed",
+		"pipx install " + skillOptTrainSkillOptWheelURL,
+		"gitmoot-skillopt optimize --help",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("missing optimizer stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateFeedbackSynced || iteration.CandidateVersionID != "" {
+		t.Fatalf("iteration after missing optimizer = %+v", iteration)
+	}
+	if !strings.Contains(iteration.MetadataJSON, `"status":"failed"`) ||
+		!strings.Contains(iteration.MetadataJSON, `"next_action":"install gitmoot-skillopt and rerun train continue"`) ||
+		!strings.Contains(iteration.MetadataJSON, "executable file not found") {
+		t.Fatalf("iteration metadata after missing optimizer = %s", iteration.MetadataJSON)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "status", "--home", home, "--session", "optimizer-train", "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train status after missing optimizer exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"status_phase": "blocked_config"`) {
+		t.Fatalf("train status did not report blocked_config:\n%s", stdout.String())
+	}
+}
+
+func TestSkillOptTrainContinueBlocksBrokenOptimizerBinary(t *testing.T) {
+	home, _ := seedSkillOptTrainFeedbackSynced(t)
+	runner := &skillOptTrainFakeOptimizerRunner{
+		versionErr:    errors.New("exit status 1"),
+		versionStderr: "ModuleNotFoundError: No module named 'openai'",
+	}
+	previousRunner := skillOptTrainOptimizerRunner
+	skillOptTrainOptimizerRunner = runner
+	defer func() {
+		skillOptTrainOptimizerRunner = previousRunner
+	}()
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{
+		"skillopt", "train", "continue",
+		"--home", home,
+		"--session", "optimizer-train",
+	}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("train continue broken optimizer exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if len(runner.preflightCalls) != 1 || len(runner.calls) != 0 {
+		t.Fatalf("optimizer calls after broken version check: preflight=%+v calls=%+v", runner.preflightCalls, runner.calls)
+	}
+	if runner.preflightCalls[0].args[0] != "--version" {
+		t.Fatalf("first preflight call = %+v, want --version", runner.preflightCalls[0])
+	}
+	for _, want := range []string{
+		"optimizer_lock: acquired",
+		"optimizer_command: /fake/bin/gitmoot-skillopt",
+		"next: install gitmoot-skillopt and rerun train continue",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("broken optimizer stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+	for _, want := range []string{
+		"version check failed",
+		"ModuleNotFoundError: No module named 'openai'",
+		"pipx install " + skillOptTrainSkillOptWheelURL,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("broken optimizer stderr missing %q:\n%s", want, stderr.String())
+		}
+	}
+
+	store := openCLIJobStore(t, home)
+	defer store.Close()
+	iteration, err := store.GetLatestSkillOptTrainIteration(context.Background(), "optimizer-train")
+	if err != nil {
+		t.Fatalf("GetLatestSkillOptTrainIteration returned error: %v", err)
+	}
+	if iteration.State != skillopt.TrainStateFeedbackSynced || iteration.CandidateVersionID != "" {
+		t.Fatalf("iteration after broken optimizer = %+v", iteration)
+	}
+	if !strings.Contains(iteration.MetadataJSON, `"status":"failed"`) ||
+		!strings.Contains(iteration.MetadataJSON, "ModuleNotFoundError") ||
+		!strings.Contains(iteration.MetadataJSON, `"next_action":"install gitmoot-skillopt and rerun train continue"`) {
+		t.Fatalf("iteration metadata after broken optimizer = %s", iteration.MetadataJSON)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"skillopt", "train", "status", "--home", home, "--session", "optimizer-train", "--json"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("train status after broken optimizer exit code = %d, stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"status_phase": "blocked_config"`) {
+		t.Fatalf("train status did not report blocked_config:\n%s", stdout.String())
+	}
+}
+
 func TestSkillOptTrainRerunRefreshesEvaluatorProfilePackage(t *testing.T) {
 	home, _ := seedSkillOptTrainFeedbackSynced(t)
 	paths := config.PathsForHome(home)
@@ -5229,6 +5370,14 @@ func TestSkillOptTrainContinueRunsLocalFakeOptimizerExecutable(t *testing.T) {
 	fakeBin := filepath.Join(t.TempDir(), "gitmoot-skillopt")
 	fakeScript := fmt.Sprintf(`#!/bin/sh
 set -eu
+if [ "${1:-}" = "--version" ]; then
+  echo "gitmoot-skillopt 0.2.0b1"
+  exit 0
+fi
+if [ "${1:-}" = "optimize" ] && [ "${2:-}" = "--help" ]; then
+  echo "usage: gitmoot-skillopt optimize"
+  exit 0
+fi
 if [ "${1:-}" != "optimize" ]; then
   echo "expected optimize subcommand" >&2
   exit 64
@@ -10902,7 +11051,13 @@ type skillOptTrainFakeOptimizerRunner struct {
 	failAfterCandidate       bool
 	failAfterCandidateStderr string
 	lookPathValue            string
+	lookPathErr              error
+	versionErr               error
+	versionStderr            string
+	helpErr                  error
+	helpStderr               string
 	beforeRun                func(dir string, args []string) error
+	preflightCalls           []skillOptTrainFakeOptimizerCall
 	calls                    []skillOptTrainFakeOptimizerCall
 }
 
@@ -10913,8 +11068,32 @@ type skillOptTrainFakeOptimizerCall struct {
 }
 
 func (r *skillOptTrainFakeOptimizerRunner) Run(_ context.Context, dir string, command string, args ...string) (subprocess.Result, error) {
-	r.calls = append(r.calls, skillOptTrainFakeOptimizerCall{dir: dir, command: command, args: append([]string{}, args...)})
 	result := subprocess.Result{Command: command, Args: args}
+	if len(args) == 1 && args[0] == "--version" {
+		r.preflightCalls = append(r.preflightCalls, skillOptTrainFakeOptimizerCall{dir: dir, command: command, args: append([]string{}, args...)})
+		if r.versionErr != nil {
+			result.Stderr = strings.TrimSpace(r.versionStderr)
+			if result.Stderr == "" {
+				result.Stderr = r.versionErr.Error()
+			}
+			return result, r.versionErr
+		}
+		result.Stdout = "gitmoot-skillopt 0.2.0b1\n"
+		return result, nil
+	}
+	if len(args) == 2 && args[0] == "optimize" && args[1] == "--help" {
+		r.preflightCalls = append(r.preflightCalls, skillOptTrainFakeOptimizerCall{dir: dir, command: command, args: append([]string{}, args...)})
+		if r.helpErr != nil {
+			result.Stderr = strings.TrimSpace(r.helpStderr)
+			if result.Stderr == "" {
+				result.Stderr = r.helpErr.Error()
+			}
+			return result, r.helpErr
+		}
+		result.Stdout = "usage: gitmoot-skillopt optimize\n"
+		return result, nil
+	}
+	r.calls = append(r.calls, skillOptTrainFakeOptimizerCall{dir: dir, command: command, args: append([]string{}, args...)})
 	if r.beforeRun != nil {
 		if err := r.beforeRun(dir, args); err != nil {
 			result.Stderr = err.Error()
@@ -10978,6 +11157,9 @@ func (r *skillOptTrainFakeOptimizerRunner) Run(_ context.Context, dir string, co
 func (r *skillOptTrainFakeOptimizerRunner) LookPath(file string) (string, error) {
 	if strings.TrimSpace(file) == "" {
 		return "", errors.New("empty file")
+	}
+	if r.lookPathErr != nil {
+		return "", r.lookPathErr
 	}
 	if strings.TrimSpace(r.lookPathValue) != "" {
 		return r.lookPathValue, nil

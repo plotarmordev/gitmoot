@@ -83,8 +83,10 @@ Gitmoot to enforce the full feedback, optimizer, candidate-review, and
 promotion loop. Use low-level `gitmoot skillopt review`, `feedback`, `export`,
 `import`, and `candidate` commands for advanced/debug work or when recovering a
 specific step. In train mode, collect enough ranked feedback and trait notes
-before optimizer handoff, keep promotion decisions explicit, and start follow-up
-iterations only through `train continue --start-next`.
+before optimizer handoff, check `gitmoot-skillopt --version` and
+`gitmoot-skillopt optimize --help` when optimizer-backed continue is needed,
+keep promotion decisions explicit, and start follow-up iterations only through
+`train continue --start-next`.
 
 For complete command examples, read [CLI.md](references/CLI.md).
 For end-to-end workflows, read [WORKFLOWS.md](references/WORKFLOWS.md).

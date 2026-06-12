@@ -414,10 +414,12 @@ evaluator config. Use `gitmoot-skillopt optimize --training-package
 training.json --artifact-root ~/.gitmoot/evals/blobs --out-root
 .gitmoot/skillopt/<run-id> --candidate-output candidate.json --dry-run` first
 to validate the contract without model calls.
-Before real model-backed optimization, check `gitmoot-skillopt optimize --help`
-and verify required model/backend environment variables for the installed
-optimizer version. `skillopt import` validates a candidate package and stores
-the candidate template as a pending version; it never promotes the candidate
+Before real model-backed optimization, check `gitmoot-skillopt --version` and
+`gitmoot-skillopt optimize --help`, or install it with
+`pipx install https://github.com/plotarmordev/gitmoot-skillopt/releases/download/v0.2.0b1/gitmoot_skillopt-0.2.0b1-py3-none-any.whl`.
+Verify required model/backend environment variables for the installed optimizer
+version. `skillopt import` validates a candidate package and stores the
+candidate template as a pending version; it never promotes the candidate
 automatically. If the candidate package includes new artifact manifest entries,
 pass `--artifact-dir` so Gitmoot can verify relative paths and SHA256 hashes
 before storing blobs. `skillopt candidate show` displays candidate metadata, eval

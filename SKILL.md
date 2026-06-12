@@ -87,6 +87,21 @@ gitmoot update --check
 gh auth status
 ```
 
+Install the separate Python optimizer before optimizer-backed SkillOpt train
+continues:
+
+```sh
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+pipx install https://github.com/plotarmordev/gitmoot-skillopt/releases/download/v0.2.0b1/gitmoot_skillopt-0.2.0b1-py3-none-any.whl
+gitmoot-skillopt --version
+gitmoot-skillopt optimize --help
+```
+
+If `pipx` is unavailable, install `gitmoot-skillopt` in a venv and pass
+`--skillopt-bin /path/to/venv/bin/gitmoot-skillopt` to `gitmoot skillopt train
+continue`.
+
 Install runtime plugin guidance when the user wants Codex or Claude Code to
 discover Gitmoot from its plugin system:
 

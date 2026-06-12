@@ -351,6 +351,9 @@ gitmoot skillopt review status --run landing-page-explore-001
 Only run the external optimizer when the user wants a candidate update and the
 status recommendation is stable enough for the current phase. Do not run heavy
 SkillOpt optimization after every tiny feedback round by default.
+Before launching it, verify `gitmoot-skillopt --version` and
+`gitmoot-skillopt optimize --help`; missing or broken installs should be
+handled as configuration blockers.
 
 ## Execution Model
 
