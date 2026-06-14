@@ -24,7 +24,7 @@
   --ifm-background-color: var(--gitmoot-bg);
   --ifm-background-surface-color: var(--gitmoot-surface);
   --ifm-navbar-background-color: var(--gitmoot-surface);
-  --ifm-footer-background-color: #111111;
+  --ifm-footer-background-color: var(--gitmoot-surface);
   --ifm-font-color-base: var(--gitmoot-fg);
   --ifm-font-color-secondary: var(--gitmoot-fg-2);
   --ifm-code-font-size: 92%;
@@ -57,7 +57,7 @@
   --ifm-background-color: var(--gitmoot-bg);
   --ifm-background-surface-color: var(--gitmoot-surface);
   --ifm-navbar-background-color: var(--gitmoot-surface);
-  --ifm-footer-background-color: #090909;
+  --ifm-footer-background-color: var(--gitmoot-surface);
   --ifm-font-color-base: var(--gitmoot-fg);
   --ifm-font-color-secondary: var(--gitmoot-fg-2);
   --ifm-code-background: var(--gitmoot-code-bg);
@@ -191,3 +191,97 @@ pre code {
   border-top: 1px solid var(--gitmoot-hairline);
 }
 
+.gitmoot-footer {
+  --gitmoot-footer-bg: color-mix(in srgb, var(--gitmoot-surface) 92%, var(--gitmoot-bg));
+  --gitmoot-footer-fg: var(--gitmoot-fg);
+  --gitmoot-footer-muted: var(--gitmoot-fg-3);
+  --gitmoot-footer-line: var(--gitmoot-hairline);
+
+  padding: 0;
+  border-top-color: var(--gitmoot-footer-line);
+  background: var(--gitmoot-footer-bg);
+  color: var(--gitmoot-footer-muted);
+}
+
+.gitmoot-footer__inner {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 36px;
+  padding-top: 34px;
+  padding-bottom: 34px;
+}
+
+.gitmoot-footer__brand {
+  display: grid;
+  max-width: 390px;
+  gap: 12px;
+}
+
+.gitmoot-footer__wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  color: var(--gitmoot-footer-fg);
+  font-size: 1.05rem;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.gitmoot-footer__wordmark:hover {
+  color: var(--gitmoot-footer-fg);
+  text-decoration: none;
+}
+
+.gitmoot-footer__wordmark img {
+  display: block;
+}
+
+.gitmoot-footer__brand p,
+.gitmoot-footer__meta p {
+  margin: 0;
+}
+
+.gitmoot-footer__meta {
+  display: grid;
+  justify-items: end;
+  gap: 14px;
+  text-align: right;
+}
+
+.gitmoot-footer__links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px 18px;
+}
+
+.gitmoot-footer__link {
+  color: var(--gitmoot-footer-fg);
+  font-weight: 760;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 4px;
+}
+
+.gitmoot-footer__link:hover {
+  color: var(--gitmoot-footer-fg);
+}
+
+@media (max-width: 520px) {
+  .gitmoot-footer__inner {
+    display: grid;
+    gap: 22px;
+    padding-top: 28px;
+    padding-bottom: 28px;
+  }
+
+  .gitmoot-footer__meta {
+    justify-items: start;
+    text-align: left;
+  }
+
+  .gitmoot-footer__links {
+    justify-content: flex-start;
+  }
+}

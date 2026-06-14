@@ -99,36 +99,16 @@ const config: Config = {
         alt: 'Gitmoot',
         src: 'img/gitmoot-logo.svg',
         href: '/intro',
-        width: 40,
-        height: 40,
+        width: 28,
+        height: 28,
       },
       links: [
-        {
-          title: 'Start',
-          items: [
-            {label: 'Introduction', to: '/intro'},
-            {label: 'Install', to: '/getting-started/install'},
-            {label: 'Quick Start', to: '/getting-started/quick-start'},
-          ],
-        },
-        {
-          title: 'Operate',
-          items: [
-            {label: 'PR Comments', to: '/workflows/pr-comment-workflow'},
-            {label: 'Planner Goals', to: '/workflows/planner-goal-workflow'},
-            {label: 'Troubleshooting', to: '/operations/troubleshooting'},
-          ],
-        },
-        {
-          title: 'Reference',
-          items: [
-            {label: 'CLI', to: '/reference/cli'},
-            {label: 'Runtime Adapters', to: '/reference/runtime-adapters'},
-            {label: 'SKILL.md', href: 'https://gitmoot.io/SKILL.md'},
-          ],
-        },
+        {label: 'Install script', href: 'https://gitmoot.io/install.sh'},
+        {label: 'SKILL.md', href: 'https://gitmoot.io/SKILL.md'},
+        {label: 'Website', href: 'https://gitmoot.io'},
+        {label: 'GitHub', href: 'https://github.com/plotarmordev/gitmoot'},
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} Gitmoot contributors.`,
+      copyright: `© ${new Date().getFullYear()} Gitmoot`,
     },
     prism: {
       theme: prismThemes.github,
