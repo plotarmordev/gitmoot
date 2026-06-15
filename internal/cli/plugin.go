@@ -11,13 +11,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
+	"strconv"
 	"strings"
 
 	"github.com/plotarmordev/gitmoot/internal/buildinfo"
 	"github.com/plotarmordev/gitmoot/internal/plugincontext"
 	"github.com/plotarmordev/gitmoot/internal/plugininstall"
 	"github.com/plotarmordev/gitmoot/internal/pluginpack"
-	"github.com/plotarmordev/gitmoot/internal/runtime"
+	gitmootruntime "github.com/plotarmordev/gitmoot/internal/runtime"
 	"github.com/plotarmordev/gitmoot/internal/subprocess"
 	"github.com/plotarmordev/gitmoot/skills"
 )
@@ -59,6 +61,8 @@ func runPlugin(args []string, stdout, stderr io.Writer) int {
 		return runPluginPath(args[1:], stdout, stderr)
 	case "doctor":
 		return runPluginDoctor(args[1:], stdout, stderr)
+	case "codex-launch":
+		return runPluginCodexLaunch(args[1:], stdout, stderr)
 	case "hook-context":
 		return runPluginHookContext(args[1:], stdout, stderr)
 	case "install":
@@ -76,6 +80,7 @@ func printPluginUsage(w io.Writer) {
 	fmt.Fprintln(w, "  gitmoot plugin install codex|claude")
 	fmt.Fprintln(w, "  gitmoot plugin path codex|claude")
 	fmt.Fprintln(w, "  gitmoot plugin doctor [codex|claude] [--live]")
+	fmt.Fprintln(w, "  gitmoot plugin codex-launch [--repo <path>] [--cli codex-face] [--config-snippet]")
 }
 
 func runPluginHookContext(_ []string, stdout, stderr io.Writer) int {
@@ -300,6 +305,52 @@ func runPluginDoctor(args []string, stdout, stderr io.Writer) int {
 	return 1
 }
 
+func runPluginCodexLaunch(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("plugin codex-launch", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	home := fs.String("home", "", "home directory to use instead of the current user's home")
+	repo := fs.String("repo", ".", "repository directory to use as the Codex working root")
+	cli := fs.String("cli", "codex-face", "Codex CLI command to launch")
+	configSnippet := fs.Bool("config-snippet", false, "print a Codex config.toml snippet instead of a launch command")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "plugin codex-launch does not accept positional arguments")
+		return 2
+	}
+
+	paths, err := pathsFromFlag(*home)
+	if err != nil {
+		fmt.Fprintf(stderr, "plugin codex-launch: %v\n", err)
+		return 1
+	}
+	repoDir := strings.TrimSpace(*repo)
+	if repoDir == "" {
+		repoDir = "."
+	}
+	absRepo, err := filepath.Abs(repoDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "plugin codex-launch: resolve repo path: %v\n", err)
+		return 1
+	}
+
+	if *configSnippet {
+		writeLine(stdout, "%s", formatCodexAccessConfig(paths.Home))
+		return 0
+	}
+	cliName := strings.TrimSpace(*cli)
+	if cliName == "" {
+		fmt.Fprintln(stderr, "plugin codex-launch: --cli is required")
+		return 2
+	}
+	writeLine(stdout, "%s", formatCodexLaunchCommand(cliName, absRepo, paths.Home, codexLaunchShell()))
+	return 0
+}
+
 func parsePluginProviderArg(args []string, fs *flag.FlagSet, stderr io.Writer, commandName string) (pluginpack.Provider, bool, bool) {
 	if len(args) == 0 {
 		fmt.Fprintf(stderr, "%s requires codex|claude\n", commandName)
@@ -395,7 +446,7 @@ func doctorRuntime(home string, provider pluginpack.Provider, explicitRuntime bo
 }
 
 func checkClaudeLive() pluginCheck {
-	if err := runtime.ClaudeLiveCheck(context.Background(), pluginDoctorRunner, ""); err != nil {
+	if err := gitmootruntime.ClaudeLiveCheck(context.Background(), pluginDoctorRunner, ""); err != nil {
 		return failCheck("runtime-live", err.Error(), true)
 	}
 	return okCheck("runtime-live", "live Claude print-mode check succeeded", true)
@@ -480,7 +531,7 @@ func checkRuntimeCLI(provider pluginpack.Provider, explicitRuntime bool) pluginC
 }
 
 func checkClaudeAuthEnv() pluginCheck {
-	auth := runtime.InspectClaudeAuthEnv(os.LookupEnv)
+	auth := gitmootruntime.InspectClaudeAuthEnv(os.LookupEnv)
 	detail := auth.MaskedDetail()
 	if warning := auth.Warning(); warning != "" {
 		detail += "; " + warning
@@ -489,6 +540,60 @@ func checkClaudeAuthEnv() pluginCheck {
 		return okCheck("runtime-auth-env", detail, false)
 	}
 	return warnCheck("runtime-auth-env", detail, false)
+}
+
+func formatCodexLaunchCommand(cli string, repo string, gitmootHome string, shell string) string {
+	args := []string{cli, "--cd", repo, "--add-dir", gitmootHome, "-s", "workspace-write"}
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		quoted = append(quoted, shellQuote(arg, shell))
+	}
+	return strings.Join(quoted, " ")
+}
+
+func formatCodexAccessConfig(gitmootHome string) string {
+	return strings.TrimRight(fmt.Sprintf(`# Gitmoot presence hook access.
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+writable_roots = [%s]
+`, strconv.Quote(gitmootHome)), "\n")
+}
+
+func codexLaunchShell() string {
+	if goruntime.GOOS == "windows" {
+		return "powershell"
+	}
+	return "posix"
+}
+
+func shellQuote(value string, shell string) string {
+	switch shell {
+	case "powershell":
+		return powershellQuote(value)
+	default:
+		return posixQuote(value)
+	}
+}
+
+func posixQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(value, " \t\r\n'\"\\$`!&;()<>|*?[]{}") {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func powershellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(value, " \t\r\n'\"`$;(){}[]&|<>") {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func checkValidationCommand(provider pluginpack.Provider, explicitRuntime bool) pluginCheck {

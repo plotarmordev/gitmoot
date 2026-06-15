@@ -15,6 +15,8 @@ remain the public audit trail.
 - Help Codex or Claude discover Gitmoot workflow instructions.
 - Add a read-only `SessionStart` presence hook that provides local Gitmoot
   context when the runtime supports hooks.
+- Include a compact local snapshot of daemon, task, job, and lock state when
+  the hook can read the local Gitmoot store.
 - Point agents to the `gitmoot` CLI for status, jobs, locks, and daemon
   management.
 
@@ -47,6 +49,26 @@ local Codex marketplace manifest, runs `codex plugin marketplace add`, and runs
 `codex plugin add gitmoot@gitmoot-local` when the `codex` CLI is available.
 
 Use `gitmoot plugin path codex` to print the generated package path.
+
+If Codex is sandboxed outside Gitmoot home, give the runtime explicit access to
+the resolved `.gitmoot` directory:
+
+```sh
+gitmoot plugin codex-launch --repo .
+```
+
+The command prints a launch line like:
+
+```sh
+codex-face --cd /path/to/repo --add-dir /home/user/.gitmoot -s workspace-write
+```
+
+On Windows it prints PowerShell-safe quoting. For persistent Codex config,
+print the matching snippet:
+
+```sh
+gitmoot plugin codex-launch --config-snippet
+```
 
 ## Install The Claude Plugin
 
@@ -91,10 +113,25 @@ JSON on stdin. The command reads the session working directory when available,
 uses local Git and Gitmoot metadata, and returns
 `hookSpecificOutput.additionalContext` for the agent.
 
-The hook is read-only context, not a control surface. It helps agents answer
-Gitmoot health and status questions directly by running relevant read-only CLI
-checks. Agents should mention `gitmoot dashboard` only after the direct answer,
-as a live monitoring follow-up for humans.
+The hook is read-only context, not a control surface. When the working
+directory belongs to a GitHub repo, it tries to open the local Gitmoot SQLite
+database read-only and injects a compact "Current snapshot" with daemon,
+task, job, and branch-lock counts for that repo. If the snapshot is unavailable,
+the hook fails open and still provides the basic repo/context guidance.
+
+Agents should answer Gitmoot health and status questions from the injected
+snapshot when it is sufficient. For more detail they should run relevant
+read-only CLI checks:
+
+- `gitmoot status --repo owner/repo`
+- `gitmoot task list --repo owner/repo --json`
+- `gitmoot job list --repo owner/repo`
+- `gitmoot lock list --repo owner/repo`
+- `gitmoot dashboard --json`
+
+They should not use nonexistent commands such as `gitmoot status --json` or
+`gitmoot task show`. Agents should mention `gitmoot dashboard` only after the
+direct answer, as a live monitoring follow-up for humans.
 
 Role split:
 

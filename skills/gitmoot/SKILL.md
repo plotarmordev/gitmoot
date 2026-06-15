@@ -44,41 +44,52 @@ same Codex or Claude session, and branch locks protect implementation ownership.
 The daemon default is `--workers 1`; raise it only for independent runtime
 sessions or managed agent types with `max_background` greater than one.
 
-For Gitmoot health or status questions, run the relevant read-only Gitmoot CLI
-checks and answer directly from the results. Mention `gitmoot dashboard` only
-after that answer, as a live monitoring follow-up. Do not start daemons, create
-agents, change subscriptions, update templates, or release locks unless the user
-asks for that action.
+For Gitmoot health or status questions, first use the injected SessionStart
+snapshot when it is present and sufficient. If more detail is needed, run the
+relevant read-only Gitmoot CLI checks and answer directly from the results.
+Mention `gitmoot dashboard` only after that answer, as a live monitoring
+follow-up. Do not start daemons, create agents, change subscriptions, update
+templates, or release locks unless the user asks for that action.
 
 ## Before Acting
 
 1. Check whether `gitmoot` is installed with `gitmoot version`.
-2. Confirm GitHub CLI access with `gh auth status` before using PR workflows.
+2. Confirm GitHub CLI access with `gh auth status` only before using PR
+   workflows or remote GitHub actions.
 3. Detect or ask for the target repo before starting daemons, subscribing agents,
    or routing jobs.
 4. Do not start daemons, create agents, update agent templates, or change
    subscriptions, or release locks unless the user asks or the current task
    clearly requires it.
-5. Prefer read-only status commands and answer directly before mutating Gitmoot
-   state or pointing the user to live monitoring.
+5. Prefer the SessionStart snapshot and read-only status commands, then answer
+   directly before mutating Gitmoot state or pointing the user to live
+   monitoring.
 
 ## Common Commands
 
-Use `gitmoot status --repo owner/repo` for repo status, `gitmoot daemon status`
-for daemon state, `gitmoot agent list` and `gitmoot agent show <agent>` for
-registered agents, `gitmoot task list --repo owner/repo` for imported task
-state, and `gitmoot agent prompt <agent-or-template>` to import an agent prompt
-into the current chat. Use `gitmoot agent run <agent> --repo owner/repo "..."`
-for coordinator delegation so Gitmoot can route to ask, review, or implement
-and own worktrees, branch locks, commits, pushes, PRs, and workflow
-advancement. Use `gitmoot agent ask <agent> --repo owner/repo "..."` only for
+Use the SessionStart "Current snapshot" for quick repo-local daemon/task/job/lock
+answers when available. Use `gitmoot status --repo owner/repo` for concise repo
+status, `gitmoot daemon status` for daemon state, `gitmoot agent list` and
+`gitmoot agent show <agent>` for registered agents. Use `gitmoot task list --repo owner/repo`
+or `gitmoot task list --repo owner/repo --json` for imported task state. Use
+`gitmoot job list --repo owner/repo` for jobs, and use
+`gitmoot dashboard --json` only when a structured full dashboard snapshot is
+needed. Do not use nonexistent commands such as `gitmoot status --json` or
+`gitmoot task show`. Use `gitmoot agent prompt <agent-or-template>` to import an
+agent prompt into the current chat. Use
+`gitmoot agent run <agent> --repo owner/repo "..."` for coordinator delegation
+so Gitmoot can route to ask, review, or implement and own worktrees, branch
+locks, commits, pushes, PRs, and workflow advancement. Use
+`gitmoot agent ask <agent> --repo owner/repo "..."` only for
 analysis, planning, or questions. Use `gitmoot agent review <agent> --repo
 owner/repo --pr <number> "..."` for PR review decisions and `gitmoot agent
 implement <agent> --repo owner/repo --task <task-id> "..."` for file changes.
 Add `--background` only when the user wants a queued background job. Use
-`gitmoot job list --repo owner/repo` for queued or recent jobs. Use
 `gitmoot plugin doctor` when checking whether Codex or Claude Code can discover
-Gitmoot through an installed runtime plugin. Use `gitmoot goal template` when
+Gitmoot through an installed runtime plugin. Use
+`gitmoot plugin codex-launch --repo <path>` to print a Codex launch command that
+adds the resolved `.gitmoot` home to the sandbox on Linux, macOS, and Windows.
+Use `gitmoot goal template` when
 writing a standard task-by-task goal file. Use
 `gitmoot report bug --job <job-id> --preview` to inspect a redacted GitHub issue
 draft for failed, blocked, or cancelled jobs; use

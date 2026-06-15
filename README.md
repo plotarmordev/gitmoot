@@ -66,6 +66,13 @@ gitmoot plugin doctor
 The plugins are discovery and guidance surfaces. The `gitmoot` CLI and local
 daemon remain the execution path.
 
+For sandboxed Codex sessions, print a launch command that grants access to the
+resolved Gitmoot home:
+
+```sh
+gitmoot plugin codex-launch --repo .
+```
+
 ## Quick Start
 
 From a project checkout:
@@ -285,6 +292,9 @@ gitmoot dashboard           # interactive cockpit
 gitmoot dashboard --json    # one-shot snapshot for scripts
 ```
 
+Agents should answer directly from the SessionStart snapshot or read-only CLI
+checks first. The dashboard remains the live cockpit for humans.
+
 ### Jobs, Locks, And Recovery
 
 ```sh
@@ -419,6 +429,7 @@ can discover Gitmoot guidance from its plugin system.
 gitmoot plugin install codex
 gitmoot plugin install claude
 gitmoot plugin doctor
+gitmoot plugin codex-launch --repo .
 ```
 
 Plugins do not start a hosted service, replace the daemon, subscribe agents, or

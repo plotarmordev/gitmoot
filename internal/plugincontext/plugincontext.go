@@ -9,10 +9,12 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/plotarmordev/gitmoot/internal/buildinfo"
 	"github.com/plotarmordev/gitmoot/internal/config"
 	gitutil "github.com/plotarmordev/gitmoot/internal/git"
+	"github.com/plotarmordev/gitmoot/internal/presence"
 	"github.com/plotarmordev/gitmoot/internal/subprocess"
 )
 
@@ -24,10 +26,11 @@ type HookInput struct {
 }
 
 type BuildOptions struct {
-	Input  HookInput
-	Info   buildinfo.Info
-	Paths  config.Paths
-	Runner subprocess.Runner
+	Input          HookInput
+	Info           buildinfo.Info
+	Paths          config.Paths
+	Runner         subprocess.Runner
+	SnapshotLoader func(context.Context, config.Paths, string) (presence.Snapshot, error)
 }
 
 type HookOutput struct {
@@ -109,9 +112,24 @@ func Build(ctx context.Context, opts BuildOptions) (string, error) {
 		fmt.Fprintln(&b, "- repo: not detected")
 	}
 	fmt.Fprintln(&b, "- dashboard command: `gitmoot dashboard`")
+	if repo.Detected {
+		fmt.Fprintln(&b)
+		snapshotLoader := opts.SnapshotLoader
+		if snapshotLoader == nil {
+			snapshotLoader = presence.BuildSnapshot
+		}
+		snapshotCtx, cancel := context.WithTimeout(ctx, time.Second)
+		snapshot, err := snapshotLoader(snapshotCtx, paths, repo.Repo)
+		cancel()
+		if err != nil {
+			fmt.Fprintln(&b, presence.FormatUnavailable())
+		} else {
+			fmt.Fprintln(&b, presence.FormatSnapshot(snapshot))
+		}
+	}
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "Guidance")
-	fmt.Fprintln(&b, "- For Gitmoot health or status questions, run relevant read-only Gitmoot CLI checks and answer directly.")
+	fmt.Fprintln(&b, "- For Gitmoot health or status questions, answer from the current snapshot when it is sufficient; otherwise run relevant read-only Gitmoot CLI checks and answer directly.")
 	fmt.Fprintln(&b, "- Mention `gitmoot dashboard` only as live monitoring follow-up after the direct answer.")
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "Guardrails")

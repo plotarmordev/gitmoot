@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -27,6 +28,53 @@ func TestRunPluginPathPrintsPackagePath(t *testing.T) {
 	want := filepath.Join(home, ".gitmoot", "plugins", "build", "codex", "gitmoot") + "\n"
 	if stdout.String() != want {
 		t.Fatalf("plugin path stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
+func TestRunPluginCodexLaunchPrintsAddDirCommand(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	home := t.TempDir()
+	repo := t.TempDir()
+
+	code := Run([]string{"plugin", "codex-launch", "--home", home, "--repo", repo}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("plugin codex-launch exit code = %d, stderr=%s", code, stderr.String())
+	}
+	want := formatCodexLaunchCommand("codex-face", repo, filepath.Join(home, ".gitmoot"), codexLaunchShell()) + "\n"
+	if stdout.String() != want {
+		t.Fatalf("plugin codex-launch stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
+func TestRunPluginCodexLaunchConfigSnippet(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	home := t.TempDir()
+
+	code := Run([]string{"plugin", "codex-launch", "--home", home, "--config-snippet"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("plugin codex-launch --config-snippet exit code = %d, stderr=%s", code, stderr.String())
+	}
+	for _, want := range []string{
+		`sandbox_mode = "workspace-write"`,
+		`[sandbox_workspace_write]`,
+		`writable_roots = [` + strconv.Quote(filepath.Join(home, ".gitmoot")) + `]`,
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("config snippet missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestFormatCodexLaunchCommandQuotesShellArguments(t *testing.T) {
+	posix := formatCodexLaunchCommand("codex-face", "/tmp/repo with spaces", "/tmp/git'moot", "posix")
+	if !strings.Contains(posix, "'/tmp/repo with spaces'") || !strings.Contains(posix, "'/tmp/git'\\''moot'") {
+		t.Fatalf("posix command did not quote safely: %s", posix)
+	}
+	powershell := formatCodexLaunchCommand("codex-face", `C:\Repo With Spaces`, `C:\Users\O'Brien\.gitmoot`, "powershell")
+	if !strings.Contains(powershell, `'C:\Repo With Spaces'`) || !strings.Contains(powershell, `'C:\Users\O''Brien\.gitmoot'`) {
+		t.Fatalf("powershell command did not quote safely: %s", powershell)
 	}
 }
 

@@ -38,10 +38,16 @@ gitmoot plugin path codex
 gitmoot plugin path claude
 gitmoot plugin doctor codex
 gitmoot plugin doctor claude
+gitmoot plugin codex-launch --repo .
+gitmoot plugin codex-launch --config-snippet
 ```
 
 Claude scopes are supported with `--scope user|project|local`. Codex ignores
 `--scope` because the current Codex plugin install command does not use it.
+Use `plugin codex-launch` when Codex needs sandbox access to the resolved
+Gitmoot home on Linux, macOS, or Windows. It prints a `codex-face --cd ...
+--add-dir ... -s workspace-write` launch command, or a persistent config
+snippet with `--config-snippet`.
 
 ## Repo And Daemon Status
 
@@ -53,6 +59,10 @@ gitmoot daemon status
 gitmoot daemon logs
 gitmoot daemon stop
 ```
+
+For structured local state, use `gitmoot dashboard --json` or
+`gitmoot task list --repo owner/repo --json`. `gitmoot status --json` and
+`gitmoot task show` are not valid commands.
 
 Use `daemon start` for the background daemon. Use `daemon run` only when the
 user explicitly wants a foreground process. Keep the default `--workers 1`

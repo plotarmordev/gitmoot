@@ -11,6 +11,7 @@ import (
 
 	"github.com/plotarmordev/gitmoot/internal/buildinfo"
 	"github.com/plotarmordev/gitmoot/internal/config"
+	"github.com/plotarmordev/gitmoot/internal/presence"
 	"github.com/plotarmordev/gitmoot/internal/subprocess"
 )
 
@@ -105,6 +106,69 @@ func TestBuildDetectsGitHubRepo(t *testing.T) {
 
 	if !strings.Contains(contextText, "- repo: \"plotarmordev/gitmoot\" (root: \"/work\")") {
 		t.Fatalf("context missing repo detection:\n%s", contextText)
+	}
+}
+
+func TestBuildIncludesReadOnlySnapshotWhenRepoDetected(t *testing.T) {
+	contextText, err := Build(context.Background(), BuildOptions{
+		Input: HookInput{CWD: "/work/subdir"},
+		Info:  testInfo(),
+		Paths: config.Paths{Home: "/home/user/.gitmoot"},
+		Runner: fakeGitRunner{
+			root:   "/work",
+			remote: "https://github.com/plotarmordev/gitmoot.git",
+		},
+		SnapshotLoader: func(_ context.Context, paths config.Paths, repo string) (presence.Snapshot, error) {
+			if paths.Home != "/home/user/.gitmoot" {
+				t.Fatalf("snapshot paths home = %q", paths.Home)
+			}
+			if repo != "plotarmordev/gitmoot" {
+				t.Fatalf("snapshot repo = %q", repo)
+			}
+			return presence.Snapshot{
+				Daemon:     presence.DaemonSnapshot{State: presence.DaemonRunning, PID: 123},
+				Tasks:      2,
+				TaskStates: map[string]int{"implementing": 1, "planned": 1},
+				Jobs:       1,
+				JobStates:  map[string]int{"succeeded": 1},
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+
+	for _, want := range []string{
+		"Current snapshot",
+		"- daemon: running (pid 123)",
+		"- tasks: 2 (implementing: 1, planned: 1)",
+		"- jobs: 1 (succeeded: 1)",
+	} {
+		if !strings.Contains(contextText, want) {
+			t.Fatalf("context missing snapshot text %q:\n%s", want, contextText)
+		}
+	}
+}
+
+func TestBuildSnapshotFailureIsNonFatal(t *testing.T) {
+	contextText, err := Build(context.Background(), BuildOptions{
+		Input: HookInput{CWD: "/work"},
+		Info:  testInfo(),
+		Paths: config.Paths{Home: "/home/user/.gitmoot"},
+		Runner: fakeGitRunner{
+			root:   "/work",
+			remote: "https://github.com/plotarmordev/gitmoot.git",
+		},
+		SnapshotLoader: func(context.Context, config.Paths, string) (presence.Snapshot, error) {
+			return presence.Snapshot{}, errors.New("db unavailable")
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build returned error: %v", err)
+	}
+
+	if !strings.Contains(contextText, "Current snapshot\n- unavailable: local Gitmoot state could not be read") {
+		t.Fatalf("context missing unavailable snapshot:\n%s", contextText)
 	}
 }
 
