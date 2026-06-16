@@ -1,6 +1,9 @@
 package workflow
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestExtractAgentResultFromFencedOutput(t *testing.T) {
 	output := "done\n```json\n" +
@@ -58,5 +61,18 @@ func TestExtractAgentResultRejectsUnsupportedDecision(t *testing.T) {
 
 	if _, err := ExtractAgentResult(output); err == nil {
 		t.Fatal("ExtractAgentResult accepted unsupported decision")
+	}
+}
+
+func TestExtractAgentResultRejectsUnsupportedField(t *testing.T) {
+	output := `{"gitmoot_result":{"decision":"approved","summary":"ok","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[],"unexpected_field":[]}}`
+
+	_, err := ExtractAgentResult(output)
+
+	if err == nil {
+		t.Fatal("ExtractAgentResult accepted unsupported field")
+	}
+	if !strings.Contains(err.Error(), `unsupported gitmoot_result field "unexpected_field"`) {
+		t.Fatalf("error = %v", err)
 	}
 }

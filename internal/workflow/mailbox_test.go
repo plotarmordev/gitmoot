@@ -187,7 +187,7 @@ func TestMailboxRunIncludesTemplateSnapshotInPrompt(t *testing.T) {
 	mailbox := Mailbox{Store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "plotarmordev/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"approved","summary":"clean","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"clean","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
 	templateContent := agenttemplate.FormatTemplateContent(agenttemplate.Metadata{
 		ID:                   "thermo",
@@ -248,7 +248,7 @@ func TestMailboxRunStoresResultAndSucceeds(t *testing.T) {
 	mailbox := Mailbox{Store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "plotarmordev/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["mailbox"],"tests_run":["go test ./..."],"needs":[],"next_agents":[]}}`,
+		`{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":["mailbox"],"tests_run":["go test ./..."],"needs":[],"delegations":[]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "implement", Repo: "plotarmordev/gitmoot", Branch: "task-005", PullRequest: 5}); err != nil {
@@ -285,7 +285,7 @@ func TestMailboxRunUsesAdapterSummaryWhenAvailable(t *testing.T) {
 	adapter := &fakeDelivery{
 		outputs: []string{`{"result":"wrapped by runtime"}`},
 		summaries: []string{
-			`{"gitmoot_result":{"decision":"approved","summary":"parsed from summary","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+			`{"gitmoot_result":{"decision":"approved","summary":"parsed from summary","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 		},
 	}
 
@@ -312,7 +312,7 @@ func TestMailboxRunRetriesMalformedOutputOnce(t *testing.T) {
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "plotarmordev/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
 		"review complete, no json",
-		`{"gitmoot_result":{"decision":"approved","summary":"clean after repair","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"clean after repair","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "review", Repo: "plotarmordev/gitmoot"}); err != nil {
@@ -347,7 +347,7 @@ func TestMailboxRunMarksBlockedDecision(t *testing.T) {
 	mailbox := Mailbox{Store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "plotarmordev/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"blocked","summary":"needs credentials","findings":[],"changes_made":[],"tests_run":[],"needs":["GITHUB_TOKEN"],"next_agents":[]}}`,
+		`{"gitmoot_result":{"decision":"blocked","summary":"needs credentials","findings":[],"changes_made":[],"tests_run":[],"needs":["GITHUB_TOKEN"],"delegations":[]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "review", Repo: "plotarmordev/gitmoot"}); err != nil {
@@ -371,7 +371,7 @@ func TestMailboxRunRejectsNonQueuedJob(t *testing.T) {
 	mailbox := Mailbox{Store: store}
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "plotarmordev/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{outputs: []string{
-		`{"gitmoot_result":{"decision":"approved","summary":"should not run","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+		`{"gitmoot_result":{"decision":"approved","summary":"should not run","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 	}}
 
 	if _, err := mailbox.Enqueue(ctx, JobRequest{ID: "job-1", Agent: "audit", Action: "review", Repo: "plotarmordev/gitmoot"}); err != nil {
@@ -405,7 +405,7 @@ func TestMailboxRunPreservesCancellationDuringDelivery(t *testing.T) {
 	agent := runtime.Agent{Name: "audit", Runtime: runtime.ShellRuntime, RuntimeRef: "printf ok", RepoScope: "plotarmordev/gitmoot", Role: "reviewer"}
 	adapter := &fakeDelivery{
 		outputs: []string{
-			`{"gitmoot_result":{"decision":"approved","summary":"completed after cancellation","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}`,
+			`{"gitmoot_result":{"decision":"approved","summary":"completed after cancellation","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}`,
 		},
 		onDeliver: func() {
 			if err := store.UpdateJobState(ctx, "job-1", string(JobCancelled)); err != nil {

@@ -2525,7 +2525,7 @@ func (r *managedSyncLockRunner) Run(ctx context.Context, _ string, command strin
 		r.t.Fatalf("runtime lock ttl = %s, want at least %s", ttl, r.minTTL)
 	}
 	r.checked = true
-	return subprocess.Result{Command: command, Args: args, Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"next_agents":[]}}` + "\n"}, nil
+	return subprocess.Result{Command: command, Args: args, Stdout: `{"gitmoot_result":{"decision":"implemented","summary":"done","findings":[],"changes_made":[],"tests_run":[],"needs":[],"delegations":[]}}` + "\n"}, nil
 }
 
 func (r *managedSyncLockRunner) LookPath(file string) (string, error) {

@@ -10,7 +10,7 @@ import (
 const resultKey = `"gitmoot_result"`
 
 // Delegation describes a child job that an agent wants Gitmoot to enqueue on
-// its behalf. It is the richer replacement for the legacy next_agents list.
+// its behalf.
 type Delegation struct {
 	ID            string   `json:"id"`
 	Agent         string   `json:"agent"`
@@ -48,20 +48,16 @@ func ExtractAgentResult(output string) (AgentResult, error) {
 		if !ok {
 			continue
 		}
-		var result AgentResult
-		if err := json.Unmarshal(raw, &result); err != nil {
+		if err := validateAgentResultFields(raw); err != nil {
 			if validationErr == nil {
 				validationErr = err
 			}
 			continue
 		}
-		var legacy struct {
-			NextAgents []string `json:"next_agents"`
-		}
-		_ = json.Unmarshal(raw, &legacy)
-		if len(legacy.NextAgents) > 0 {
+		var result AgentResult
+		if err := json.Unmarshal(raw, &result); err != nil {
 			if validationErr == nil {
-				validationErr = fmt.Errorf("legacy next_agents is no longer supported; use delegations")
+				validationErr = err
 			}
 			continue
 		}
@@ -78,6 +74,29 @@ func ExtractAgentResult(output string) (AgentResult, error) {
 		return AgentResult{}, validationErr
 	}
 	return AgentResult{}, errors.New("missing valid gitmoot_result JSON object")
+}
+
+func validateAgentResultFields(raw json.RawMessage) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	allowed := map[string]struct{}{
+		"decision":      {},
+		"summary":       {},
+		"findings":      {},
+		"changes_made":  {},
+		"tests_run":     {},
+		"needs":         {},
+		"delegations":   {},
+		"artifact_body": {},
+	}
+	for field := range fields {
+		if _, ok := allowed[field]; !ok {
+			return fmt.Errorf("unsupported gitmoot_result field %q", field)
+		}
+	}
+	return nil
 }
 
 func validateAgentResult(result AgentResult) error {
