@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2576,6 +2577,185 @@ func TestEngineDelegationDepthCapStopsDispatch(t *testing.T) {
 	}
 }
 
+// TestEngineDelegationRootJobIDPropagates pins the lineage scaffolding the loop
+// detector relies on: an originating coordinator has no RootJobID, so its own id
+// is the root; both its delegation children and its continuation inherit that
+// same root so the whole coordination tree shares one originating id.
+func TestEngineDelegationRootJobIDPropagates(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "plotarmordev/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "plotarmordev/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "plotarmordev/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "w1", Agent: "w", Action: "review", Prompt: "do work"},
+			},
+		},
+	})
+
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+
+	// The child inherits the originating coordinator's id as its root.
+	child := mustJob(t, store, "root-job/delegation/w1")
+	childPayload, err := unmarshalPayload(child.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(child) returned error: %v", err)
+	}
+	if childPayload.RootJobID != "root-job" {
+		t.Fatalf("child RootJobID = %q, want %q", childPayload.RootJobID, "root-job")
+	}
+
+	// Once the child finishes, the continuation must share the same root.
+	completeDelegationChild(t, store, "root-job/delegation/w1", JobSucceeded, AgentResult{Decision: "approved", Summary: "w1 ok"})
+	if err := engine.AdvanceJob(ctx, "root-job/delegation/w1"); err != nil {
+		t.Fatalf("AdvanceJob(child) returned error: %v", err)
+	}
+	continuation := mustJob(t, store, delegationContinuationID("root-job"))
+	continuationPayload, err := unmarshalPayload(continuation.Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(continuation) returned error: %v", err)
+	}
+	if continuationPayload.RootJobID != "root-job" {
+		t.Fatalf("continuation RootJobID = %q, want %q", continuationPayload.RootJobID, "root-job")
+	}
+}
+
+// TestContinuationPromptIncludesCompletionContract pins the L1 completion
+// contract: the continuation prompt must explicitly tell the coordinator to
+// finish by returning an EMPTY delegations list when the goal is complete.
+func TestContinuationPromptIncludesCompletionContract(t *testing.T) {
+	prompt := buildContinuationPrompt(
+		&AgentResult{Delegations: []Delegation{{ID: "w1", Agent: "w"}}},
+		map[string]db.Job{},
+		map[string]JobPayload{},
+	)
+	if !strings.Contains(prompt, "EMPTY delegations list") {
+		t.Fatalf("continuation prompt missing completion contract: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Only return new delegations if more work is genuinely required") {
+		t.Fatalf("continuation prompt missing completion-contract guidance: %q", prompt)
+	}
+}
+
+// TestEngineDelegationBudgetCapStopsDispatch pins the L3 per-root job budget: a
+// coordinator tree that re-delegates wide is halted once it has produced
+// MaxDelegationTotalJobs jobs. Dispatch is refused with a
+// delegation_budget_exceeded event and no further children are created.
+func TestEngineDelegationBudgetCapStopsDispatch(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "plotarmordev/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "plotarmordev/gitmoot")
+	engine := testEngine(store)
+
+	// Seed MaxDelegationTotalJobs jobs already belonging to the root's tree: the
+	// originating coordinator itself plus enough children stamped with its root.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "plotarmordev/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "w1", Agent: "w", Action: "review", Prompt: "do work"},
+			},
+		},
+	})
+	for i := 1; i < MaxDelegationTotalJobs; i++ {
+		insertCompletedJob(t, store, db.Job{ID: fmt.Sprintf("root-job/filler/%d", i), Agent: "w", Type: "review"}, JobPayload{
+			Repo:      "plotarmordev/gitmoot",
+			Branch:    "task-005",
+			TaskID:    "task-5",
+			Sender:    "coord",
+			RootJobID: "root-job",
+		})
+	}
+
+	count, err := engine.countRootDelegationJobs(ctx, "root-job")
+	if err != nil {
+		t.Fatalf("countRootDelegationJobs returned error: %v", err)
+	}
+	if count != MaxDelegationTotalJobs {
+		t.Fatalf("countRootDelegationJobs = %d, want %d", count, MaxDelegationTotalJobs)
+	}
+
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+
+	// At the budget: dispatch is refused and no child is created.
+	if jobExists(t, store, "root-job/delegation/w1") {
+		t.Fatal("delegation must NOT be dispatched once the per-root budget is reached")
+	}
+	events, err := store.ListJobEvents(ctx, "root-job")
+	if err != nil {
+		t.Fatalf("ListJobEvents returned error: %v", err)
+	}
+	budgeted := false
+	for _, ev := range events {
+		if ev.Kind == "delegation_budget_exceeded" {
+			budgeted = true
+		}
+	}
+	if !budgeted {
+		t.Fatal("expected a delegation_budget_exceeded event at the per-root budget")
+	}
+}
+
+// TestEngineDelegationWidthCapStopsDispatch covers the per-coordinator fan-out
+// width cap: the total-jobs budget is checked before a batch is dispatched, so
+// it cannot stop one enormous single fan-out; the width cap does.
+func TestEngineDelegationWidthCapStopsDispatch(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "plotarmordev/gitmoot")
+	seedAgent(t, store, "w", []string{"ask"}, "plotarmordev/gitmoot")
+	engine := testEngine(store)
+
+	dels := make([]Delegation, 0, MaxDelegationWidth+1)
+	for i := 0; i <= MaxDelegationWidth; i++ {
+		dels = append(dels, Delegation{ID: fmt.Sprintf("d%d", i), Agent: "w", Action: "ask", Prompt: "work"})
+	}
+	insertCompletedJob(t, store, db.Job{ID: "wide-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo: "plotarmordev/gitmoot", Branch: "task-005", TaskID: "task-5", Sender: "coord",
+		Result: &AgentResult{Decision: "approved", Summary: "too wide", Delegations: dels},
+	})
+	if err := engine.AdvanceJob(ctx, "wide-job"); err != nil {
+		t.Fatalf("AdvanceJob(wide): %v", err)
+	}
+	if jobExists(t, store, "wide-job/delegation/d0") {
+		t.Fatal("a delegation set wider than MaxDelegationWidth must not be dispatched")
+	}
+	events, err := store.ListJobEvents(ctx, "wide-job")
+	if err != nil {
+		t.Fatalf("ListJobEvents: %v", err)
+	}
+	widened := false
+	for _, ev := range events {
+		if ev.Kind == "delegation_width_exceeded" {
+			widened = true
+		}
+	}
+	if !widened {
+		t.Fatal("expected a delegation_width_exceeded event")
+	}
+}
+
 // TestEngineDelegationEscalateThenBlockParentFoldsIntoContinuation pins the
 // contradictory-state fix: once an escalate failure has enqueued the
 // continuation, a later block_parent sibling failure must NOT also block the
@@ -2898,4 +3078,232 @@ func (f *fakeMergeGate) Evaluate(_ context.Context, request MergeRequest) (Merge
 		f.onEvaluate(request)
 	}
 	return f.decision, nil
+}
+
+// TestCanonicalDelegationSetHashStableUnderReorder pins the order-independence and
+// change-sensitivity contract the loop detector relies on: reordering the same
+// delegation set yields the same hash, while changing any field (prompt, agent,
+// or a dep) yields a different one.
+func TestCanonicalDelegationSetHashStableUnderReorder(t *testing.T) {
+	base := []Delegation{
+		{ID: "a", Agent: "wa", Action: "review", Prompt: "step a", Deps: []string{"x", "y"}},
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+	}
+	reordered := []Delegation{
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+		{ID: "a", Agent: "wa", Action: "review", Prompt: "step a", Deps: []string{"y", "x"}},
+	}
+	if canonicalDelegationSetHash(base) != canonicalDelegationSetHash(reordered) {
+		t.Fatal("hash must be stable under delegation and dep reordering")
+	}
+	// Whitespace-only prompt differences are normalized away.
+	trimmed := []Delegation{
+		{ID: "a", Agent: "wa", Action: "review", Prompt: "  step a  ", Deps: []string{"x", "y"}},
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+	}
+	if canonicalDelegationSetHash(base) != canonicalDelegationSetHash(trimmed) {
+		t.Fatal("hash must ignore surrounding prompt whitespace")
+	}
+
+	promptChanged := []Delegation{
+		{ID: "a", Agent: "wa", Action: "review", Prompt: "DIFFERENT", Deps: []string{"x", "y"}},
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+	}
+	agentChanged := []Delegation{
+		{ID: "a", Agent: "OTHER", Action: "review", Prompt: "step a", Deps: []string{"x", "y"}},
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+	}
+	depChanged := []Delegation{
+		{ID: "a", Agent: "wa", Action: "review", Prompt: "step a", Deps: []string{"x", "z"}},
+		{ID: "b", Agent: "wb", Action: "review", Prompt: "step b"},
+	}
+	baseHash := canonicalDelegationSetHash(base)
+	for name, changed := range map[string][]Delegation{
+		"prompt": promptChanged,
+		"agent":  agentChanged,
+		"dep":    depChanged,
+	} {
+		if canonicalDelegationSetHash(changed) == baseHash {
+			t.Fatalf("hash must change when the %s changes", name)
+		}
+	}
+}
+
+// TestAppendDelegationHashWindowKeepsLastThree pins the sliding-window bound: only
+// the most recent delegationHashWindowSize hashes are retained.
+func TestAppendDelegationHashWindowKeepsLastThree(t *testing.T) {
+	var window []string
+	for _, h := range []string{"h1", "h2", "h3", "h4"} {
+		window = appendDelegationHashWindow(window, h)
+	}
+	if len(window) != delegationHashWindowSize {
+		t.Fatalf("window length = %d, want %d", len(window), delegationHashWindowSize)
+	}
+	want := []string{"h2", "h3", "h4"}
+	if !equalStrings(window, want) {
+		t.Fatalf("window = %v, want %v", window, want)
+	}
+}
+
+// driveStaticGeneration simulates one coordinator continuation generation: it
+// stamps the already-enqueued continuation job with a delegation result (the
+// same set every time, modeling a static coordinator) and advances it, which is
+// exactly what the daemon does when the continuation runs and re-delegates.
+func driveStaticGeneration(t *testing.T, store *db.Store, engine Engine, continuationID string, dels []Delegation) error {
+	t.Helper()
+	completeDelegationChild(t, store, continuationID, JobSucceeded, AgentResult{
+		Decision:    "approved",
+		Summary:     "still working",
+		Delegations: dels,
+	})
+	return engine.AdvanceJob(context.Background(), continuationID)
+}
+
+// TestEngineStaticCoordinatorHaltedByLoopDetection is the core regression: a
+// coordinator whose continuation re-issues the SAME delegation set every round is
+// stopped by windowed non-progress detection (a warning + corrective nudge, then
+// a delegation_loop_detected halt) well before MaxDelegationDepth — not left to
+// the blunt depth cap.
+func TestEngineStaticCoordinatorHaltedByLoopDetection(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "plotarmordev/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "plotarmordev/gitmoot")
+	engine := testEngine(store)
+
+	dels := []Delegation{{ID: "w1", Agent: "w", Action: "review", Prompt: "do work"}}
+
+	// Generation 0: the originating coordinator dispatches the set for real.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "plotarmordev/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result:    &AgentResult{Decision: "approved", Summary: "round 0", Delegations: dels},
+	})
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+	if !jobExists(t, store, "root-job/delegation/w1") {
+		t.Fatal("generation 0 must dispatch the delegation for real")
+	}
+
+	// Child finishes -> continuation (generation 1) is enqueued carrying the
+	// window with generation 0's hash.
+	completeDelegationChild(t, store, "root-job/delegation/w1", JobSucceeded, AgentResult{Decision: "approved", Summary: "w1 ok"})
+	if err := engine.AdvanceJob(ctx, "root-job/delegation/w1"); err != nil {
+		t.Fatalf("AdvanceJob(child) returned error: %v", err)
+	}
+	continuationID := delegationContinuationID("root-job")
+	if !jobExists(t, store, continuationID) {
+		t.Fatal("a continuation must be enqueued after the child finishes")
+	}
+
+	// Generation 1: the continuation re-issues the SAME set. This is the first
+	// repeat -> a warning fires and a corrective continuation is enqueued INSTEAD
+	// of dispatching. The corrective continuation reuses the continuation id.
+	if err := driveStaticGeneration(t, store, engine, continuationID, dels); err != nil {
+		t.Fatalf("driveStaticGeneration(gen1) returned error: %v", err)
+	}
+	if countJobEvents(t, store, continuationID, "delegation_loop_warning") != 1 {
+		t.Fatal("first repeat must record exactly one delegation_loop_warning")
+	}
+	correctiveID := delegationContinuationID(continuationID)
+	if !jobExists(t, store, correctiveID) {
+		t.Fatal("first repeat must enqueue a corrective continuation instead of dispatching")
+	}
+	correctivePayload, err := unmarshalPayload(mustJob(t, store, correctiveID).Payload)
+	if err != nil {
+		t.Fatalf("unmarshalPayload(corrective) returned error: %v", err)
+	}
+	if correctivePayload.DelegationRepeatCount != 1 {
+		t.Fatalf("corrective DelegationRepeatCount = %d, want 1", correctivePayload.DelegationRepeatCount)
+	}
+	if !strings.Contains(correctivePayload.Instructions, "EMPTY delegations list") {
+		t.Fatalf("corrective prompt missing the change-or-finish nudge: %q", correctivePayload.Instructions)
+	}
+
+	// Generation 2: the coordinator repeats AGAIN after the corrective nudge ->
+	// delegation_loop_detected halts it with no further dispatch.
+	if err := driveStaticGeneration(t, store, engine, correctiveID, dels); err != nil {
+		t.Fatalf("driveStaticGeneration(gen2) returned error: %v", err)
+	}
+	if countJobEvents(t, store, correctiveID, "delegation_loop_detected") != 1 {
+		t.Fatal("second repeat after a nudge must record delegation_loop_detected")
+	}
+	// No further child or continuation may be created off the halted generation.
+	if jobExists(t, store, delegationContinuationID(correctiveID)) {
+		t.Fatal("delegation_loop_detected must not enqueue another continuation")
+	}
+
+	// It stopped well before the blunt depth cap: the deepest job created carries
+	// a DelegationDepth far below MaxDelegationDepth.
+	if correctivePayload.DelegationDepth >= MaxDelegationDepth {
+		t.Fatalf("loop detection must halt well before MaxDelegationDepth=%d (depth=%d)", MaxDelegationDepth, correctivePayload.DelegationDepth)
+	}
+}
+
+// TestEngineProgressingCoordinatorNotFalselyFlagged pins the false-positive guard:
+// a coordinator that issues a DIFFERENT delegation set each continuation keeps
+// dispatching for real and is never flagged as a loop.
+func TestEngineProgressingCoordinatorNotFalselyFlagged(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "plotarmordev/gitmoot")
+	seedAgent(t, store, "w", []string{"review"}, "plotarmordev/gitmoot")
+	engine := testEngine(store)
+
+	// Generation 0: dispatch the first distinct set for real.
+	insertCompletedJob(t, store, db.Job{ID: "root-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:      "plotarmordev/gitmoot",
+		Branch:    "task-005",
+		TaskID:    "task-5",
+		TaskTitle: "Parent",
+		Sender:    "coord",
+		Result: &AgentResult{
+			Decision:    "approved",
+			Summary:     "round 0",
+			Delegations: []Delegation{{ID: "w1", Agent: "w", Action: "review", Prompt: "round 0 work"}},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "root-job"); err != nil {
+		t.Fatalf("AdvanceJob(root) returned error: %v", err)
+	}
+
+	completeDelegationChild(t, store, "root-job/delegation/w1", JobSucceeded, AgentResult{Decision: "approved", Summary: "w1 ok"})
+	if err := engine.AdvanceJob(ctx, "root-job/delegation/w1"); err != nil {
+		t.Fatalf("AdvanceJob(child) returned error: %v", err)
+	}
+
+	// Walk several generations, each issuing a DISTINCT delegation set. Every
+	// generation must dispatch a real child and never warn or halt.
+	parentID := "root-job"
+	for round := 1; round <= 4; round++ {
+		continuationID := delegationContinuationID(parentID)
+		if !jobExists(t, store, continuationID) {
+			t.Fatalf("round %d: continuation must be enqueued", round)
+		}
+		delID := fmt.Sprintf("w%d", round+1)
+		dels := []Delegation{{ID: delID, Agent: "w", Action: "review", Prompt: fmt.Sprintf("round %d work", round)}}
+		if err := driveStaticGeneration(t, store, engine, continuationID, dels); err != nil {
+			t.Fatalf("round %d: generation returned error: %v", round, err)
+		}
+		if countJobEvents(t, store, continuationID, "delegation_loop_warning") != 0 {
+			t.Fatalf("round %d: a progressing coordinator must not warn", round)
+		}
+		if countJobEvents(t, store, continuationID, "delegation_loop_detected") != 0 {
+			t.Fatalf("round %d: a progressing coordinator must not be halted", round)
+		}
+		childID := continuationID + "/delegation/" + delID
+		if !jobExists(t, store, childID) {
+			t.Fatalf("round %d: a distinct set must dispatch a real child %s", round, childID)
+		}
+		// Finish the round's child so the next continuation is enqueued.
+		completeDelegationChild(t, store, childID, JobSucceeded, AgentResult{Decision: "approved", Summary: "ok"})
+		if err := engine.AdvanceJob(ctx, childID); err != nil {
+			t.Fatalf("round %d: AdvanceJob(child) returned error: %v", round, err)
+		}
+		parentID = continuationID
+	}
 }

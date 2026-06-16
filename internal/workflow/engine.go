@@ -2,10 +2,13 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -464,10 +467,22 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// rootJobID returns the id of the coordinator that originated a coordination
+// tree. A child or continuation inherits its parent's RootJobID via the payload;
+// the originating coordinator has no RootJobID, so its own job id is the root.
+// Every job in one tree therefore shares a single root, which lets the loop
+// detector and per-root budget reason about the whole tree at once.
+func (e Engine) rootJobID(job db.Job, payload JobPayload) string {
+	if strings.TrimSpace(payload.RootJobID) != "" {
+		return payload.RootJobID
+	}
+	return job.ID
+}
+
 // delegationRequest builds the canonical child JobRequest for a delegation,
 // inheriting the parent's repo/branch/PR context and stamping the DAG fields
-// (ParentJobID/DelegationID/DelegationDepth/DelegatedBy/Deps). It is shared by
-// dispatchDelegations (initial enqueue of ready delegations) and
+// (ParentJobID/DelegationID/DelegationDepth/DelegatedBy/RootJobID/Deps). It is
+// shared by dispatchDelegations (initial enqueue of ready delegations) and
 // advanceDelegations (deferred enqueue once deps clear) so both paths produce
 // identical, idempotent requests for the same delegation ID.
 func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) JobRequest {
@@ -492,6 +507,7 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		DelegationID:    d.ID,
 		DelegationDepth: payload.DelegationDepth + 1,
 		DelegatedBy:     job.Agent,
+		RootJobID:       e.rootJobID(job, payload),
 		Deps:            compactStrings(d.Deps),
 		JobTimeout:      strings.TrimSpace(d.Timeout),
 		Fingerprint:     strings.TrimSpace(d.Fingerprint),
@@ -509,6 +525,107 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 // looping agent) would otherwise spawn jobs forever.
 const MaxDelegationDepth = 8
 
+// MaxDelegationTotalJobs bounds how many jobs a single coordination tree (all
+// children and continuations sharing one root, see rootJobID) may produce. Where
+// MaxDelegationDepth caps nesting in one branch, this caps the total fan-out so a
+// coordinator that re-delegates wide (rather than deep) on every continuation is
+// still halted. Once a root's tree reaches this many jobs, dispatchDelegations
+// refuses further children and records a delegation_budget_exceeded event.
+const MaxDelegationTotalJobs = 64
+
+// MaxDelegationWidth bounds how many delegations a single coordinator result may
+// fan out in one generation. The total-jobs budget is checked before a batch is
+// dispatched, so it cannot stop one enormous fan-out on its own; this caps the
+// width of a single dispatch so a coordinator returning hundreds of delegations
+// at once is refused with a delegation_width_exceeded event.
+const MaxDelegationWidth = 16
+
+// delegationHashWindowSize is how many recent delegation-set hashes a coordinator
+// continuation chain remembers (threaded via the payload, not scanned across
+// jobs). A repeat within this sliding window is what the loop detector treats as
+// non-progress: a coordinator re-issuing a delegation set it already issued.
+// NOTE (follow-up, issue #305 "Later"): detection is set-only (not result-aware)
+// and only catches cycles of period <= delegationHashWindowSize; longer cycles
+// fall back to the depth/total-job/width backstops.
+// continuation chain remembers (threaded via the payload, not scanned across
+// jobs). A repeat within this sliding window is what the loop detector treats as
+// non-progress: a coordinator re-issuing a delegation set it already issued.
+const delegationHashWindowSize = 3
+
+// canonicalDelegationSetHash hashes a delegation set into a stable, order-
+// independent fingerprint so two continuations that re-issue "the same work"
+// produce the same hash even if the delegations are listed in a different order.
+// Delegations are sorted by ID; for each, the ID, Agent, Action, trimmed Prompt,
+// and sorted/compacted Deps are emitted with a separator that cannot appear in a
+// normal field, then the whole thing is SHA-256 hashed. Any change to a prompt,
+// agent, action, dep, or the set of ids changes the hash; pure reordering does
+// not.
+func canonicalDelegationSetHash(dels []Delegation) string {
+	sorted := make([]Delegation, len(dels))
+	copy(sorted, dels)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+
+	var builder strings.Builder
+	for _, d := range sorted {
+		deps := compactStrings(d.Deps)
+		sort.Strings(deps)
+		fields := []string{d.ID, d.Agent, d.Action, strings.TrimSpace(d.Prompt), strings.Join(deps, ",")}
+		builder.WriteString(strings.Join(fields, "\x1f"))
+		builder.WriteString("\x1e")
+	}
+	sum := sha256.Sum256([]byte(builder.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// appendDelegationHashWindow appends h to the sliding window, keeping only the
+// most recent delegationHashWindowSize entries so the loop detector reasons over
+// a bounded history threaded through the payload.
+func appendDelegationHashWindow(window []string, h string) []string {
+	window = append(window, h)
+	if len(window) > delegationHashWindowSize {
+		window = window[len(window)-delegationHashWindowSize:]
+	}
+	return window
+}
+
+// windowContainsHash reports whether the sliding window already holds h, i.e. the
+// coordinator is re-issuing a delegation set it issued within the last few
+// generations.
+func windowContainsHash(window []string, h string) bool {
+	for _, existing := range window {
+		if existing == h {
+			return true
+		}
+	}
+	return false
+}
+
+// countRootDelegationJobs counts every job belonging to a coordination tree: the
+// originating coordinator itself (job.ID == rootID) plus every child or
+// continuation whose payload RootJobID points back at it. There is no store query
+// keyed on root, so it lists all jobs and filters (mirroring childDelegationJobs).
+func (e Engine) countRootDelegationJobs(ctx context.Context, rootID string) (int, error) {
+	jobs, err := e.Store.ListJobs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, job := range jobs {
+		if job.ID == rootID {
+			count++
+			continue
+		}
+		payload, err := unmarshalPayload(job.Payload)
+		if err != nil {
+			return 0, err
+		}
+		if payload.RootJobID == rootID {
+			count++
+		}
+	}
+	return count, nil
+}
+
 func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) error {
 	if payload.Result == nil || len(payload.Result.Delegations) == 0 {
 		return nil
@@ -521,6 +638,39 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 			Message: fmt.Sprintf("delegation depth %d reached the limit of %d; not dispatching %d delegation(s)", payload.DelegationDepth, MaxDelegationDepth, len(payload.Result.Delegations)),
 		})
 		return nil
+	}
+
+	rootID := e.rootJobID(job, payload)
+	total, err := e.countRootDelegationJobs(ctx, rootID)
+	if err != nil {
+		return err
+	}
+	if total >= MaxDelegationTotalJobs {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_budget_exceeded",
+			Message: fmt.Sprintf("delegation tree for root %s reached the job budget of %d (%d jobs); not dispatching %d delegation(s)", rootID, MaxDelegationTotalJobs, total, len(payload.Result.Delegations)),
+		})
+		return nil
+	}
+
+	if width := len(payload.Result.Delegations); width > MaxDelegationWidth {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_width_exceeded",
+			Message: fmt.Sprintf("delegation set width %d exceeds the per-coordinator limit of %d; not dispatching", width, MaxDelegationWidth),
+		})
+		return nil
+	}
+
+	// Windowed non-progress detection. The depth/budget caps above are blunt
+	// safety nets; this catches the common loop sooner: a coordinator whose
+	// continuation re-issues a delegation set it already issued within the last
+	// few generations (the window threaded through the payload). A real,
+	// progressing coordinator emits a different set each round, so its hash is
+	// never in the window and dispatch proceeds untouched.
+	if stopped, err := e.handleDelegationLoop(ctx, job, payload, ref); err != nil || stopped {
+		return err
 	}
 
 	delegations := payload.Result.Delegations
@@ -568,6 +718,89 @@ func (e Engine) dispatchDelegations(ctx context.Context, job db.Job, payload Job
 		}
 	}
 	return nil
+}
+
+// handleDelegationLoop implements the windowed non-progress check. It compares
+// the current delegation set's canonical hash against the sliding window
+// threaded through the payload and decides whether dispatch should be halted:
+//
+//   - the hash is NOT in the window: not a repeat. Returns (false, nil); the
+//     caller dispatches normally and maybeEnqueueContinuation records this hash
+//     in the window for the next generation.
+//   - the hash IS in the window and the coordinator was already nudged once
+//     (DelegationRepeatCount >= 1): a confirmed loop. Records a
+//     delegation_loop_detected event and returns (true, nil) so dispatch is
+//     skipped — the coordinator got a corrective continuation and repeated anyway.
+//   - the hash IS in the window for the first time: records a
+//     delegation_loop_warning and, instead of dispatching, enqueues one
+//     corrective continuation that tells the coordinator to change its approach
+//     or finish. Returns (true, nil) so the repeat is not dispatched.
+//
+// Returning (true, ...) means "do not dispatch"; (false, nil) means "proceed".
+func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload JobPayload, ref taskRef) (bool, error) {
+	currentHash := canonicalDelegationSetHash(payload.Result.Delegations)
+	if !windowContainsHash(payload.RecentDelegationHashes, currentHash) {
+		return false, nil
+	}
+
+	// Idempotent on re-advance: if this job already emitted a loop event it has
+	// already enqueued its corrective continuation (deterministic id), so do not
+	// re-emit the event or double-count it.
+	events, err := e.Store.ListJobEvents(ctx, job.ID)
+	if err != nil {
+		return true, err
+	}
+	for _, ev := range events {
+		if ev.Kind == "delegation_loop_warning" || ev.Kind == "delegation_loop_detected" {
+			return true, nil
+		}
+	}
+
+	if payload.DelegationRepeatCount >= 1 {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_loop_detected",
+			Message: fmt.Sprintf("delegation set %s repeated after a corrective nudge (repeat count %d); not dispatching %d delegation(s)", currentHash, payload.DelegationRepeatCount, len(payload.Result.Delegations)),
+		})
+		return true, nil
+	}
+
+	_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+		JobID:   job.ID,
+		Kind:    "delegation_loop_warning",
+		Message: fmt.Sprintf("delegation set %s repeats a recent round; sending a corrective continuation instead of dispatching %d delegation(s)", currentHash, len(payload.Result.Delegations)),
+	})
+
+	request := JobRequest{
+		ID:              delegationContinuationID(job.ID),
+		Agent:           job.Agent,
+		Action:          "ask",
+		Repo:            payload.Repo,
+		Branch:          payload.Branch,
+		PullRequest:     payload.PullRequest,
+		HeadSHA:         payload.HeadSHA,
+		GoalID:          payload.GoalID,
+		TaskID:          payload.TaskID,
+		TaskTitle:       payload.TaskTitle,
+		LeadAgent:       payload.LeadAgent,
+		Reviewers:       payload.Reviewers,
+		Sender:          job.Agent,
+		Instructions:    buildCorrectiveContinuationPrompt(payload.Result),
+		Constraints:     payload.Constraints,
+		ParentJobID:     job.ID,
+		DelegationDepth: payload.DelegationDepth + 1,
+		DelegatedBy:     job.Agent,
+		RootJobID:       e.rootJobID(job, payload),
+		// Carry the window forward (now including this repeat) and mark that a
+		// corrective nudge has fired, so if the next generation repeats again the
+		// detector escalates to delegation_loop_detected.
+		RecentDelegationHashes: appendDelegationHashWindow(payload.RecentDelegationHashes, currentHash),
+		DelegationRepeatCount:  payload.DelegationRepeatCount + 1,
+	}
+	if err := e.enqueue(ctx, request); err != nil {
+		return true, fmt.Errorf("enqueue corrective continuation for %q: %w", job.ID, err)
+	}
+	return true, nil
 }
 
 // enqueueDelegation allocates the per-delegation worktree (or branch lock) for
@@ -881,27 +1114,36 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 	}
 
 	request := JobRequest{
-		ID:              delegationContinuationID(parentJob.ID),
-		Agent:           parentJob.Agent,
-		Action:          "ask",
-		Repo:            parentPayload.Repo,
-		Branch:          parentPayload.Branch,
-		PullRequest:     parentPayload.PullRequest,
-		HeadSHA:         parentPayload.HeadSHA,
-		GoalID:          parentPayload.GoalID,
-		TaskID:          parentPayload.TaskID,
-		TaskTitle:       parentPayload.TaskTitle,
-		LeadAgent:       parentPayload.LeadAgent,
-		Reviewers:       parentPayload.Reviewers,
-		Sender:          parentJob.Agent,
-		Instructions:    buildContinuationPrompt(parentResult, children, childPayloads),
-		Constraints:     parentPayload.Constraints,
-		ParentJobID:     parentJob.ID,
+		ID:           delegationContinuationID(parentJob.ID),
+		Agent:        parentJob.Agent,
+		Action:       "ask",
+		Repo:         parentPayload.Repo,
+		Branch:       parentPayload.Branch,
+		PullRequest:  parentPayload.PullRequest,
+		HeadSHA:      parentPayload.HeadSHA,
+		GoalID:       parentPayload.GoalID,
+		TaskID:       parentPayload.TaskID,
+		TaskTitle:    parentPayload.TaskTitle,
+		LeadAgent:    parentPayload.LeadAgent,
+		Reviewers:    parentPayload.Reviewers,
+		Sender:       parentJob.Agent,
+		Instructions: buildContinuationPrompt(parentResult, children, childPayloads),
+		Constraints:  parentPayload.Constraints,
+		ParentJobID:  parentJob.ID,
 		// Increment depth per continuation generation so a coordinator whose
 		// continuation re-delegates is bounded by MaxDelegationDepth instead of
 		// looping forever (the continuation reused the parent's depth before).
 		DelegationDepth: parentPayload.DelegationDepth + 1,
 		DelegatedBy:     parentJob.Agent,
+		// Share the originating coordinator's root so the whole continuation
+		// chain counts against one per-root budget and is visible to loop detection.
+		RootJobID: e.rootJobID(parentJob, parentPayload),
+		// Record the delegation set that was actually dispatched in the sliding
+		// window so the next generation can detect a non-progress repeat. A real
+		// dispatch happened => progress, so reset the repeat counter; the
+		// corrective-nudge counter only climbs while the coordinator loops.
+		RecentDelegationHashes: appendDelegationHashWindow(parentPayload.RecentDelegationHashes, canonicalDelegationSetHash(parentResult.Delegations)),
+		DelegationRepeatCount:  0,
 	}
 	if err := e.enqueue(ctx, request); err != nil {
 		return fmt.Errorf("enqueue continuation for %q: %w", parentJob.ID, err)
@@ -1277,6 +1519,26 @@ func buildContinuationPrompt(parentResult *AgentResult, children map[string]db.J
 			fmt.Fprintf(&builder, " (%s)", link)
 		}
 		builder.WriteString("\n")
+	}
+	// Completion contract: make termination directed. The engine already treats
+	// an empty delegations list as terminal, so spell it out for the agent.
+	builder.WriteString("\n\nIf the goal is now complete, return your result with an EMPTY delegations list to finish. Only return new delegations if more work is genuinely required.")
+	return builder.String()
+}
+
+// buildCorrectiveContinuationPrompt is the one-shot nudge sent when a
+// coordinator re-issues a delegation set it already issued. It tells the
+// coordinator the repeat changed nothing and asks it to change approach or
+// finish, then lists the repeated delegations for context. If it repeats again,
+// handleDelegationLoop escalates to delegation_loop_detected and stops.
+func buildCorrectiveContinuationPrompt(parentResult *AgentResult) string {
+	var builder strings.Builder
+	builder.WriteString("You delegated the same set as a previous round; it did not change the outcome. Change your approach or return an EMPTY delegations list to finish.\n\n")
+	if parentResult != nil && len(parentResult.Delegations) > 0 {
+		builder.WriteString("Repeated delegation set:\n")
+		for _, d := range parentResult.Delegations {
+			fmt.Fprintf(&builder, "- delegation %q (agent %s, action %s)\n", d.ID, d.Agent, d.Action)
+		}
 	}
 	return builder.String()
 }

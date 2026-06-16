@@ -19,37 +19,40 @@ type Mailbox struct {
 }
 
 type JobRequest struct {
-	ID                    string
-	Agent                 string
-	Action                string
-	Repo                  string
-	Branch                string
-	PullRequest           int
-	HeadSHA               string
-	GoalID                string
-	TaskID                string
-	TaskTitle             string
-	LeadAgent             string
-	Reviewers             []string
-	ReviewRound           string
-	Sender                string
-	Instructions          string
-	Constraints           []string
-	ParentJobID           string
-	DelegationID          string
-	DelegationDepth       int
-	DelegatedBy           string
-	Deps                  []string
-	JobTimeout            string
-	RetryCount            int
-	Fingerprint           string
-	FailurePolicy         string
-	SynthesisRule         string
-	DelegationArtifactDir string
-	WorktreePath          string
-	OriginalAgent         string
-	DelegatedAgent        string
-	DelegationReason      string
+	ID                     string
+	Agent                  string
+	Action                 string
+	Repo                   string
+	Branch                 string
+	PullRequest            int
+	HeadSHA                string
+	GoalID                 string
+	TaskID                 string
+	TaskTitle              string
+	LeadAgent              string
+	Reviewers              []string
+	ReviewRound            string
+	Sender                 string
+	Instructions           string
+	Constraints            []string
+	ParentJobID            string
+	DelegationID           string
+	DelegationDepth        int
+	DelegatedBy            string
+	RootJobID              string
+	Deps                   []string
+	JobTimeout             string
+	RetryCount             int
+	Fingerprint            string
+	FailurePolicy          string
+	SynthesisRule          string
+	DelegationArtifactDir  string
+	WorktreePath           string
+	OriginalAgent          string
+	DelegatedAgent         string
+	DelegationReason       string
+	RecentDelegationHashes []string
+	DelegationRepeatCount  int
 }
 
 type JobPayload struct {
@@ -70,6 +73,7 @@ type JobPayload struct {
 	DelegationID           string       `json:"delegation_id,omitempty"`
 	DelegationDepth        int          `json:"delegation_depth,omitempty"`
 	DelegatedBy            string       `json:"delegated_by,omitempty"`
+	RootJobID              string       `json:"root_job_id,omitempty"`
 	Deps                   []string     `json:"deps,omitempty"`
 	JobTimeout             string       `json:"job_timeout,omitempty"`
 	RetryCount             int          `json:"retry_count,omitempty"`
@@ -84,6 +88,8 @@ type JobPayload struct {
 	OriginalAgent          string       `json:"original_agent,omitempty"`
 	DelegatedAgent         string       `json:"delegated_agent,omitempty"`
 	DelegationReason       string       `json:"delegation_reason,omitempty"`
+	RecentDelegationHashes []string     `json:"recent_delegation_hashes,omitempty"`
+	DelegationRepeatCount  int          `json:"delegation_repeat_count,omitempty"`
 	RawOutputs             []string     `json:"raw_outputs,omitempty"`
 	Result                 *AgentResult `json:"result,omitempty"`
 }
@@ -123,6 +129,7 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		DelegationID:           request.DelegationID,
 		DelegationDepth:        request.DelegationDepth,
 		DelegatedBy:            request.DelegatedBy,
+		RootJobID:              request.RootJobID,
 		Deps:                   compactStrings(request.Deps),
 		JobTimeout:             strings.TrimSpace(request.JobTimeout),
 		RetryCount:             request.RetryCount,
@@ -137,6 +144,8 @@ func (m Mailbox) Enqueue(ctx context.Context, request JobRequest) (db.Job, error
 		OriginalAgent:          request.OriginalAgent,
 		DelegatedAgent:         request.DelegatedAgent,
 		DelegationReason:       request.DelegationReason,
+		RecentDelegationHashes: request.RecentDelegationHashes,
+		DelegationRepeatCount:  request.DelegationRepeatCount,
 	})
 	if err != nil {
 		return db.Job{}, err
