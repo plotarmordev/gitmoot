@@ -218,7 +218,7 @@ func TestTrainLineageBase(t *testing.T) {
 		{"officeqa-treasury-skillopt-v1", "officeqa-treasury-skillopt", true},
 		{"officeqa-treasury-skillopt-v8", "officeqa-treasury-skillopt", true},
 		{"run-v12", "run", true},
-		{"run-12", "run-12", false},     // bare numeric is NOT a version lineage
+		{"run-12", "run-12", false},                         // bare numeric is NOT a version lineage
 		{"train-x-20260611-1", "train-x-20260611-1", false}, // timestamp tail, not a version
 		{"plain-name", "plain-name", false},
 		{"train-aaa", "train-aaa", false},
@@ -259,11 +259,15 @@ func TestTrainsListGroupsAndCollapses(t *testing.T) {
 			t.Fatalf("expected section header %q:\n%s", want, view)
 		}
 	}
-	// Two skillopt-v* sessions collapse under one lineage parent line.
-	if !strings.Contains(view, "skillopt  ") || !strings.Contains(view, "×2") {
-		t.Fatalf("expected collapsed lineage parent 'skillopt ×2':\n%s", view)
+	// Repo is the only group: the repo header carries the count, and there is NO
+	// separate lineage sub-group line (e.g. "skillopt  ×2") inside it.
+	if !strings.Contains(view, "o/r") {
+		t.Fatalf("expected the repo group header:\n%s", view)
 	}
-	// All individual session ids still render (children + flat rows).
+	if strings.Contains(view, "skillopt  ×") {
+		t.Fatalf("lineage sub-group line should be gone (only the repo group remains):\n%s", view)
+	}
+	// All individual session ids still render directly under the repo.
 	for _, id := range []string{"skillopt-v1", "skillopt-v2", "lonely", "stalled", "gone"} {
 		if !strings.Contains(view, id) {
 			t.Fatalf("expected session %q in view:\n%s", id, view)
@@ -313,5 +317,110 @@ func TestTrainCursorFollowsDisplayOrder(t *testing.T) {
 	}
 	if got, _ := m.trainUnderCursor(); got.ID != "done-early" {
 		t.Fatalf("cursor 1 should select the next visible row (done-early), got %q", got.ID)
+	}
+}
+
+// TestTrainsGroupByRepoWithinSection verifies that within a status section,
+// sessions are sub-grouped by repo (first-appearance order) with lineage
+// collapse inside each repo, and the cursor follows that display order.
+func TestTrainsGroupByRepoWithinSection(t *testing.T) {
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		Trains: []TrainSession{
+			{ID: "a-v1", Phase: "items_ready", Repo: "o/alpha"},      // Active, alpha, lineage
+			{ID: "b1", Phase: "generating_options", Repo: "o/beta"},  // Active, beta, lone
+			{ID: "a-v2", Phase: "review_published", Repo: "o/alpha"}, // Active, alpha, lineage
+		},
+	}
+	deps := Deps{Load: func() (Snapshot, error) { return snap, nil }}
+	m := sizedModel(deps)
+	next, _ := m.Update(snapshotMsg{snap: snap, at: time.Unix(1, 0)})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // Attention → Trains
+	m = next.(Model)
+	view := m.View()
+	for _, want := range []string{"Active", "o/alpha", "o/beta", "a-v1", "a-v2", "b1"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("trains view missing %q:\n%s", want, view)
+		}
+	}
+	// Repos in first-appearance order: alpha before beta.
+	if strings.Index(view, "o/alpha") > strings.Index(view, "o/beta") {
+		t.Fatalf("repos out of order (alpha before beta):\n%s", view)
+	}
+	// alpha's lineage collapses; its members precede beta's session.
+	v1, v2, b := strings.Index(view, "a-v1"), strings.Index(view, "a-v2"), strings.Index(view, "b1")
+	if !(v1 < v2 && v2 < b) {
+		t.Fatalf("repo/lineage order wrong (want a-v1<a-v2<b1): %d %d %d\n%s", v1, v2, b, view)
+	}
+	// Cursor 0 selects the first display row (a-v1 under alpha).
+	if got, _ := m.trainUnderCursor(); got.ID != "a-v1" {
+		t.Fatalf("cursor 0 should select a-v1, got %q", got.ID)
+	}
+}
+
+// TestTrainsCollapseRepoFoldsSessions verifies space folds the cursor's repo
+// group (hiding its sessions and showing a [+] header) and that the collapsed
+// header is selectable so space re-expands it.
+func TestTrainsCollapseRepoFoldsSessions(t *testing.T) {
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		Trains: []TrainSession{
+			{ID: "a1", Phase: "items_ready", Repo: "o/alpha"},
+			{ID: "b1", Phase: "items_ready", Repo: "o/beta"},
+		},
+	}
+	deps := Deps{Load: func() (Snapshot, error) { return snap, nil }}
+	m := sizedModel(deps)
+	next, _ := m.Update(snapshotMsg{snap: snap, at: time.Unix(1, 0)})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // → Trains
+	m = next.(Model)
+	// Cursor 0 = a1 (o/alpha). Space folds o/alpha.
+	next, _ = m.Update(key(" "))
+	m = next.(Model)
+	view := m.View()
+	if strings.Contains(view, "a1") {
+		t.Fatalf("a1 should be hidden after folding o/alpha:\n%s", view)
+	}
+	if !strings.Contains(view, "[+]") {
+		t.Fatalf("folded repo should show a [+] marker:\n%s", view)
+	}
+	if !strings.Contains(view, "b1") {
+		t.Fatalf("o/beta should still be visible:\n%s", view)
+	}
+	// Cursor now sits on the collapsed o/alpha header; space re-expands it.
+	next, _ = m.Update(key(" "))
+	m = next.(Model)
+	if !strings.Contains(m.View(), "a1") {
+		t.Fatalf("expanding o/alpha should restore a1:\n%s", m.View())
+	}
+}
+
+// TestTrainsCollapsedByDefault verifies the live default (CollapseGroupsByDefault)
+// folds repo groups on first show, and space on a [+] header expands one.
+func TestTrainsCollapsedByDefault(t *testing.T) {
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		Trains: []TrainSession{{ID: "s1", Phase: "items_ready", Repo: "o/alpha"}},
+	}
+	deps := Deps{Load: func() (Snapshot, error) { return snap, nil }, CollapseGroupsByDefault: true}
+	m := sizedModel(deps)
+	next, _ := m.Update(snapshotMsg{snap: snap, at: time.Unix(1, 0)})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab}) // → Trains
+	m = next.(Model)
+	view := m.View()
+	if strings.Contains(view, "s1") {
+		t.Fatalf("sessions should be folded by default:\n%s", view)
+	}
+	if !strings.Contains(view, "[+]") {
+		t.Fatalf("collapsed repo should show a [+] marker:\n%s", view)
+	}
+	// Space on the collapsed repo header expands it.
+	next, _ = m.Update(key(" "))
+	m = next.(Model)
+	if !strings.Contains(m.View(), "s1") {
+		t.Fatalf("space should expand the repo and reveal s1:\n%s", m.View())
 	}
 }

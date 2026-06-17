@@ -86,6 +86,16 @@ type Model struct {
 	loadErr  string
 	inFlight bool
 
+	// expanded records explicit user open(true)/close(false) decisions for
+	// collapsible group headers (Attention / Trains), keyed by a page-qualified
+	// group key; it overrides collapseByDefault and persists across refresh ticks
+	// while the key is stable (a Trains group's key includes its status section,
+	// so a session changing section moves to that section's group). collapseByDefault
+	// is the state for groups the user has not touched — the live dashboard sets it
+	// true so groups start folded.
+	expanded          map[string]bool
+	collapseByDefault bool
+
 	// Attention / Trains page interaction state.
 	mode         mode
 	promptCursor int                  // selected row in snap.Prompts on the Attention page
@@ -169,12 +179,14 @@ type Model struct {
 // Init issues the first Load and arms the refresh tick.
 func New(deps Deps) Model {
 	m := Model{
-		deps:       deps,
-		width:      100,
-		height:     30,
-		viewport:   viewport.New(80, 20),
-		inFlight:   true,
-		cancelling: map[string]struct{}{},
+		deps:              deps,
+		width:             100,
+		height:            30,
+		viewport:          viewport.New(80, 20),
+		inFlight:          true,
+		cancelling:        map[string]struct{}{},
+		expanded:          map[string]bool{},
+		collapseByDefault: deps.CollapseGroupsByDefault,
 	}
 	m.resizeViewport()
 	m.viewport.SetContent(m.content())
@@ -294,6 +306,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
+		case " ":
+			// Toggle a collapsible group header (Attention / Trains).
+			if m.toggleCurrentGroup() {
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
 		case "a":
 			if pages[m.selected].page == pageAttention {
 				if cmd := m.openAnswer(); cmd != nil {
@@ -314,6 +332,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			}
 		case "enter":
+			// On a collapsible page, enter on a group header toggles it (so the
+			// header is a usable target without leaving the keyboard home keys).
+			if m.cursorOnHeader() {
+				m.toggleCurrentGroup()
+				m.viewport.SetContent(m.content())
+				return m, tea.Batch(cmds...)
+			}
 			if pages[m.selected].page == pageConfig {
 				fields := m.configEditableFields()
 				if m.deps.SetConfigScalar != nil && m.configCursor < len(fields) {
@@ -328,12 +353,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// inline detail (keeps the model usable standalone and old tests
 				// green). Pushing is suppressed while an optimize start is in
 				// flight: its result message routes to the top of the stack, so a
-				// covering view would swallow it.
-				if m.deps.OpenTrain != nil && len(m.snap.Trains) > 0 && !m.optimizeBusy {
-					session := m.snap.Trains[m.trainCursor].ID
-					return m, Push(m.deps.OpenTrain(session))
+				// covering view would swallow it. Resolve the session through the
+				// cursor (display order), not raw snapshot order.
+				if t, ok := m.trainUnderCursor(); ok {
+					if m.deps.OpenTrain != nil && !m.optimizeBusy {
+						return m, Push(m.deps.OpenTrain(t.ID))
+					}
+					m.openTrainDetail()
 				}
-				m.openTrainDetail()
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
 			}
@@ -925,9 +952,9 @@ func (m Model) healthRequiredFailed() bool {
 func (m *Model) pageCursor() (*int, int) {
 	switch pages[m.selected].page {
 	case pageAttention:
-		return &m.promptCursor, len(m.attentionItems())
+		return &m.promptCursor, selectableCount(m.attentionVisibleRows())
 	case pageTrains:
-		return &m.trainCursor, len(m.snap.Trains)
+		return &m.trainCursor, selectableCount(m.trainVisibleRows())
 	case pageAgents:
 		return &m.agentCursor, len(m.visibleAgents())
 	case pageSessions:
@@ -951,15 +978,113 @@ func clampCursor(cursor, n int) int {
 	return cursor
 }
 
-// clampPromptCursor keeps the Attention cursor within the current item list
-// (prompts plus blocked/failed jobs) after a refresh removes rows.
+// clampPromptCursor keeps the Attention cursor within the current selectable
+// rows (prompt/job leaves plus collapsed repo headers) after a refresh/collapse.
 func (m *Model) clampPromptCursor() {
-	m.promptCursor = clampCursor(m.promptCursor, len(m.attentionItems()))
+	m.promptCursor = clampCursor(m.promptCursor, selectableCount(m.attentionVisibleRows()))
 }
 
-// clampTrainCursor keeps the Trains cursor within the current session list.
+// clampTrainCursor keeps the Trains cursor within the current selectable rows.
 func (m *Model) clampTrainCursor() {
-	m.trainCursor = clampCursor(m.trainCursor, len(m.snap.Trains))
+	m.trainCursor = clampCursor(m.trainCursor, selectableCount(m.trainVisibleRows()))
+}
+
+// currentListRows returns the visible collapsible rows for the current page, if
+// it is a collapsible-list page (Attention or Trains).
+func (m Model) currentListRows() ([]listRow, bool) {
+	switch pages[m.selected].page {
+	case pageAttention:
+		return m.attentionVisibleRows(), true
+	case pageTrains:
+		return m.trainVisibleRows(), true
+	}
+	return nil, false
+}
+
+// selectedListRow returns the row under the current page's cursor (among the
+// selectable rows), if the page is a collapsible list.
+func (m Model) selectedListRow() (listRow, bool) {
+	rows, ok := m.currentListRows()
+	if !ok {
+		return listRow{}, false
+	}
+	cursor, _ := m.pageCursor()
+	if cursor == nil {
+		return listRow{}, false
+	}
+	return selectableRowAt(rows, *cursor)
+}
+
+// cursorOnHeader reports whether the cursor sits on a collapsed group header
+// (the only kind of header the cursor can land on).
+func (m Model) cursorOnHeader() bool {
+	r, ok := m.selectedListRow()
+	return ok && r.header
+}
+
+// groupCollapsed reports whether a group is collapsed. An explicit user
+// open/close (stored in m.expanded) wins; otherwise the page default applies
+// (collapseByDefault — the live dashboard starts groups folded to reduce
+// clutter, while tests default to expanded).
+func (m Model) groupCollapsed(key string) bool {
+	if v, ok := m.expanded[key]; ok {
+		return !v
+	}
+	return m.collapseByDefault
+}
+
+// toggleCurrentGroup opens or closes a repo group: on a collapsed header it
+// expands; on a leaf it collapses that leaf's group. The state is stored
+// explicitly (not as a delete), so it holds regardless of the default. Since the
+// cursor stays in place, pressing space on a just-opened group's first row
+// closes it again. Returns true when it changed something.
+func (m *Model) toggleCurrentGroup() bool {
+	r, ok := m.selectedListRow()
+	if !ok {
+		return false
+	}
+	if m.expanded == nil {
+		m.expanded = map[string]bool{}
+	}
+	switch {
+	case r.header && r.collapsed:
+		m.expanded[r.key] = true
+	case !r.header && r.groupKey != "":
+		m.expanded[r.groupKey] = false
+		// Folding from a leaf removes that leaf (and its siblings) from the
+		// selectable set; move the cursor onto the now-collapsed header so the
+		// highlight follows the group instead of clamping onto an unrelated row.
+		m.focusHeader(r.groupKey)
+	default:
+		return false
+	}
+	m.clampPromptCursor()
+	m.clampTrainCursor()
+	return true
+}
+
+// focusHeader points the current page's cursor at the selectable header whose
+// group key matches, after that group was just collapsed.
+func (m *Model) focusHeader(key string) {
+	rows, ok := m.currentListRows()
+	if !ok {
+		return
+	}
+	cursor, _ := m.pageCursor()
+	if cursor == nil {
+		return
+	}
+	sel := 0
+	for _, row := range rows {
+		if !row.selectable() {
+			continue
+		}
+		if row.header && row.key == key {
+			*cursor = sel
+			return
+		}
+		sel++
+	}
 }
 
 // clampJobCursor keeps the Jobs cursor within the current job list.

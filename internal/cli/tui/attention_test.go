@@ -295,3 +295,75 @@ func TestAttentionCursorClampedOnRefresh(t *testing.T) {
 		t.Fatalf("empty attention page expected:\n%s", m.View())
 	}
 }
+
+// TestAttentionGroupsJobsByRepo verifies the blocked/failed jobs render under
+// repo sub-headers, with same-repo jobs contiguous, and the cursor walking them
+// in that display order.
+func TestAttentionGroupsJobsByRepo(t *testing.T) {
+	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		JobRows: []JobRow{
+			{ID: "j1", Type: "ask", State: "failed", Repo: "o/alpha"},
+			{ID: "j2", Type: "ask", State: "blocked", Repo: "o/beta"},
+			{ID: "j3", Type: "ask", State: "failed", Repo: "o/alpha"},
+		},
+	}
+	m := attentionModel(t, deps, snap)
+	view := m.View()
+	for _, want := range []string{"Blocked & failed jobs (3)", "o/alpha", "o/beta", "j1", "j2", "j3"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("attention view missing %q:\n%s", want, view)
+		}
+	}
+	// alpha is first-seen so its jobs (j1, j3) are contiguous and precede beta's j2.
+	i1, i3, i2 := strings.Index(view, "j1"), strings.Index(view, "j3"), strings.Index(view, "j2")
+	if !(i1 < i3 && i3 < i2) {
+		t.Fatalf("jobs not grouped by repo (want j1<j3<j2): j1=%d j3=%d j2=%d\n%s", i1, i3, i2, view)
+	}
+	// Cursor walks the repo-grouped order: 0=j1, 1=j3, 2=j2.
+	wants := []string{"j1", "j3", "j2"}
+	for i, want := range wants {
+		got, ok := m.jobUnderCursor()
+		if !ok || got.ID != want {
+			t.Fatalf("cursor %d should select %q, got %q ok=%v", i, want, got.ID, ok)
+		}
+		if i < len(wants)-1 {
+			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+			m = next.(Model)
+		}
+	}
+}
+
+// TestAttentionCollapseJobRepo verifies a job repo group folds with space and
+// re-expands, while prompts and other repos stay put.
+func TestAttentionCollapseJobRepo(t *testing.T) {
+	deps := Deps{Load: func() (Snapshot, error) { return Snapshot{}, nil }}
+	snap := Snapshot{
+		Daemon: Daemon{Running: true},
+		JobRows: []JobRow{
+			{ID: "j1", Type: "ask", State: "failed", Repo: "o/alpha"},
+			{ID: "j2", Type: "ask", State: "blocked", Repo: "o/beta"},
+		},
+	}
+	m := attentionModel(t, deps, snap)
+	// Cursor 0 = j1 (o/alpha). Space folds o/alpha.
+	next, _ := m.Update(key(" "))
+	m = next.(Model)
+	view := m.View()
+	if strings.Contains(view, "j1") {
+		t.Fatalf("j1 should be hidden after folding o/alpha:\n%s", view)
+	}
+	if !strings.Contains(view, "[+]") {
+		t.Fatalf("folded repo should show a [+] marker:\n%s", view)
+	}
+	if !strings.Contains(view, "j2") {
+		t.Fatalf("o/beta job should still be visible:\n%s", view)
+	}
+	// Space on the collapsed header re-expands it.
+	next, _ = m.Update(key(" "))
+	m = next.(Model)
+	if !strings.Contains(m.View(), "j1") {
+		t.Fatalf("expanding o/alpha should restore j1:\n%s", m.View())
+	}
+}

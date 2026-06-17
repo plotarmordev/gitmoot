@@ -93,7 +93,8 @@ func runDashboardTUI(home string, interval time.Duration, stdout, stderr io.Writ
 // DB) so the TUI always reflects current state, including live train phases.
 func dashboardTUIDeps(home string, interval time.Duration) tui.Deps {
 	return tui.Deps{
-		Interval: interval,
+		Interval:                interval,
+		CollapseGroupsByDefault: true,
 		Load: func() (tui.Snapshot, error) {
 			paths, err := initializedPaths(home)
 			if err != nil {
@@ -513,6 +514,7 @@ func toTUISnapshot(s dashboardSnapshot) tui.Snapshot {
 			State:       row.State,
 			UpdatedAt:   row.UpdatedAt,
 			LatestEvent: row.LatestEvent,
+			Repo:        row.Repo,
 		})
 	}
 	return out

@@ -18,18 +18,19 @@ func (m *Model) openTrainDetail() {
 	}
 }
 
-// trainUnderCursor returns the session under the Trains cursor, if any. The
-// cursor indexes the display-ordered list (orderedTrains), not raw snapshot
-// order, so it resolves to the row the user sees highlighted.
+// trainUnderCursor returns the session under the Trains cursor, if the cursor is
+// on a session row (not a collapsible header). The cursor indexes the visible
+// rows; a leaf resolves through its itemIdx into orderedTrains().
 func (m Model) trainUnderCursor() (TrainSession, bool) {
 	if pages[m.selected].page != pageTrains {
 		return TrainSession{}, false
 	}
+	idx := selectedItemIndex(m.trainVisibleRows(), m.trainCursor)
 	ordered := m.orderedTrains()
-	if m.trainCursor < 0 || m.trainCursor >= len(ordered) {
+	if idx < 0 || idx >= len(ordered) {
 		return TrainSession{}, false
 	}
-	return ordered[m.trainCursor], true
+	return ordered[idx], true
 }
 
 // openTrainStop enters the stop-reason overlay for a live session.
@@ -291,19 +292,26 @@ type trainGroup struct {
 	members []TrainSession
 }
 
-// trainSectionGroups returns the display-ordered groups for one status category.
-// Sessions are taken in snapshot order; a base shared by more than one session
-// in the category collapses into a single group whose members stay contiguous
-// (in snapshot order), emitted at the position of its first member. This keeps
-// every lineage child under its own parent even when members are not adjacent
-// in the snapshot.
-func (m Model) trainSectionGroups(cat int) []trainGroup {
-	var rows []TrainSession
-	for _, t := range m.snap.Trains {
-		if trainStatusCategory(t.Phase) == cat {
-			rows = append(rows, t)
-		}
+// trainRepoBucket is one repository's lineage groups within a status section.
+type trainRepoBucket struct {
+	repo   string
+	groups []trainGroup
+}
+
+// trainRepoLabel is a session's target repo, or "(no repo)" when it has none.
+func trainRepoLabel(repo string) string {
+	if strings.TrimSpace(repo) == "" {
+		return "(no repo)"
 	}
+	return repo
+}
+
+// lineageGroups buckets sessions into display groups: a base shared by more than
+// one session collapses into a single group whose members stay contiguous (in
+// the given order, emitted at the first member's position); everything else is a
+// lone group in place. This keeps every lineage child under its own parent even
+// when members are not adjacent.
+func lineageGroups(rows []TrainSession) []trainGroup {
 	counts := map[string]int{}
 	for _, t := range rows {
 		if base, ok := trainLineageBase(t.ID); ok {
@@ -333,18 +341,104 @@ func (m Model) trainSectionGroups(cat int) []trainGroup {
 	return groups
 }
 
+// trainSectionRepos returns the display-ordered repo buckets for one status
+// category: the category's sessions (snapshot order) bucketed by repo in
+// first-appearance order, each with its lineage groups.
+func (m Model) trainSectionRepos(cat int) []trainRepoBucket {
+	var rows []TrainSession
+	for _, t := range m.snap.Trains {
+		if trainStatusCategory(t.Phase) == cat {
+			rows = append(rows, t)
+		}
+	}
+	order := []string{}
+	byRepo := map[string][]TrainSession{}
+	for _, t := range rows {
+		label := trainRepoLabel(t.Repo)
+		if _, ok := byRepo[label]; !ok {
+			order = append(order, label)
+		}
+		byRepo[label] = append(byRepo[label], t)
+	}
+	out := make([]trainRepoBucket, 0, len(order))
+	for _, label := range order {
+		out = append(out, trainRepoBucket{repo: label, groups: lineageGroups(byRepo[label])})
+	}
+	return out
+}
+
+// bucketMemberCount is the total sessions across a repo bucket's lineage groups.
+func bucketMemberCount(rb trainRepoBucket) int {
+	n := 0
+	for _, g := range rb.groups {
+		n += len(g.members)
+	}
+	return n
+}
+
 // orderedTrains is the flat, display-ordered list of sessions — the exact
-// top-to-bottom order rows render in (sections Active→Blocked→Done, lineages
-// contiguous). The Trains cursor indexes into THIS slice, so ↑/↓ steps through
-// the visible list in order and selection matches the highlighted row.
+// top-to-bottom order rows render in (sections Active→Blocked→Done, then by repo,
+// then lineages contiguous). The Trains cursor indexes into THIS slice, so ↑/↓
+// steps through the visible list in order and selection matches the highlight.
 func (m Model) orderedTrains() []TrainSession {
 	var out []TrainSession
 	for _, cat := range []int{trainCatActive, trainCatBlocked, trainCatDone} {
-		for _, g := range m.trainSectionGroups(cat) {
-			out = append(out, g.members...)
+		for _, rb := range m.trainSectionRepos(cat) {
+			for _, g := range rb.groups {
+				out = append(out, g.members...)
+			}
 		}
 	}
 	return out
+}
+
+// trainRowContent is the per-session row text (id + phase, dimmed when the run
+// is terminal) used as the leaf content in the collapsible Trains list.
+func trainRowContent(t TrainSession) string {
+	phase := t.Phase
+	if deadTrainPhase(t.Phase) {
+		phase = mutedStyle.Render(t.Phase)
+	}
+	return t.ID + "  " + phase
+}
+
+// trainListRows builds the Trains page's collapsible row tree:
+// status section (Active/Blocked/Done) → repo → session. The repo is the only
+// collapsible group; sessions list directly under it (lineage versions stay
+// contiguous via rb.groups ordering, but without a separate sub-group line).
+// Leaf itemIdx indexes orderedTrains() (built in the same order).
+func (m Model) trainListRows() []listRow {
+	var rows []listRow
+	idx := 0
+	for _, cat := range []int{trainCatActive, trainCatBlocked, trainCatDone} {
+		repos := m.trainSectionRepos(cat)
+		if len(repos) == 0 {
+			continue
+		}
+		title := trainSectionTitles[cat]
+		rows = append(rows, staticRow(0, title)) // status section: display-only
+		for _, rb := range repos {
+			// Key by (section, repo) so the same repo in two sections folds
+			// independently (matching the two visually separate groups). The fold
+			// state holds while a session's section is stable; if a session changes
+			// section its row moves to that section's group (collapsed by default).
+			repoKey := "trains:" + title + ":" + rb.repo
+			rows = append(rows, headerRow(repoKey, 1, rb.repo+"  ×"+strconv.Itoa(bucketMemberCount(rb))))
+			for _, g := range rb.groups {
+				for _, t := range g.members {
+					rows = append(rows, leafRow(2, trainRowContent(t), idx, repoKey))
+					idx++
+				}
+			}
+		}
+	}
+	return rows
+}
+
+// trainVisibleRows is the Trains tree filtered by the collapse state — the rows
+// rendered, and the index space m.trainCursor walks.
+func (m Model) trainVisibleRows() []listRow {
+	return visibleListRows(m.trainListRows(), m.groupCollapsed)
 }
 
 func (m Model) trainsContent() string {
@@ -355,57 +449,9 @@ func (m Model) trainsContent() string {
 		return m.loadingOr("No train sessions.", !m.loadedAt.IsZero())
 	}
 	var b strings.Builder
-
-	// pos is the display position of the next selectable session row; it must
-	// advance in lockstep with orderedTrains() so the cursor highlights and
-	// selects the same row. Section headers and lineage parents are display-only
-	// and consume no position.
-	pos := 0
-	first := true
-	for _, cat := range []int{trainCatActive, trainCatBlocked, trainCatDone} {
-		groups := m.trainSectionGroups(cat)
-		if len(groups) == 0 {
-			continue
-		}
-		if !first {
-			b.WriteByte('\n')
-		}
-		first = false
-		b.WriteString(headerStyle.Render(trainSectionTitles[cat]))
-		b.WriteByte('\n')
-		for _, g := range groups {
-			if len(g.members) > 1 {
-				b.WriteString("  " + g.base + "  " + mutedStyle.Render("×"+strconv.Itoa(len(g.members))) + "\n")
-				for _, t := range g.members {
-					m.writeTrainRow(&b, t, pos == m.trainCursor, "    ")
-					pos++
-				}
-				continue
-			}
-			m.writeTrainRow(&b, g.members[0], pos == m.trainCursor, "  ")
-			pos++
-		}
-	}
-
-	b.WriteString(mutedStyle.Render("enter open  s stop  d delete"))
-	b.WriteByte('\n')
+	renderListRows(&b, m.trainVisibleRows(), m.trainCursor)
+	b.WriteString("\n" + mutedStyle.Render("↑/↓ move · space open/close repo · enter open · s stop · d delete") + "\n")
 	return b.String()
-}
-
-// writeTrainRow renders a single selectable session row at the given indent.
-// selected is true when this row's display position is under the cursor; the
-// cursor row replaces the trailing two spaces of indent with the "▸ " marker so
-// columns stay aligned.
-func (m Model) writeTrainRow(b *strings.Builder, t TrainSession, selected bool, indent string) {
-	phase := t.Phase
-	if deadTrainPhase(t.Phase) {
-		phase = mutedStyle.Render(t.Phase)
-	}
-	if selected {
-		b.WriteString(indent[:len(indent)-2] + "▸ " + selectedRowStyle.Render(t.ID) + "  " + phase + "\n")
-		return
-	}
-	b.WriteString(indent + t.ID + "  " + phase + "\n")
 }
 
 func (m Model) trainDetail() string {

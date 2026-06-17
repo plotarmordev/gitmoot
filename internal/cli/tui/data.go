@@ -149,7 +149,9 @@ type Jobs struct {
 }
 
 // JobRow is one job the Jobs page can act on. LatestEvent is filled for
-// blocked/failed jobs (the "why" shown in the attention list).
+// blocked/failed jobs (the "why" shown in the attention list). Repo is filled
+// for reportable (blocked/failed/cancelled) jobs so the Attention page can group
+// them by repository.
 type JobRow struct {
 	ID          string
 	Agent       string
@@ -157,6 +159,7 @@ type JobRow struct {
 	State       string
 	UpdatedAt   string
 	LatestEvent string
+	Repo        string
 }
 
 // JobDetail is the job's parsed payload, loaded lazily when its detail opens
@@ -244,6 +247,11 @@ type Deps struct {
 	Answer   func(id, value string) error
 	Dismiss  func(id string) error
 	Interval time.Duration
+
+	// CollapseGroupsByDefault folds collapsible repo groups (Attention / Trains)
+	// on first show, so the live dashboard opens uncluttered; the user expands
+	// what they want with space. Tests leave it false (groups start expanded).
+	CollapseGroupsByDefault bool
 
 	// OpenTrain, when set, builds the embedded train-run model for a session;
 	// the Trains page pushes it onto the Root stack instead of the inline
