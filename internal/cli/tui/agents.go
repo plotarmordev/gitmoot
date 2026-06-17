@@ -14,13 +14,27 @@ import (
 // template. The leading sentinel form keeps it from colliding with a real id.
 const agentCustomPromptValue = "__custom_prompt__"
 
-// agentUnderCursor returns the agent under the Agents cursor, if any.
+// agentUnderCursor returns the agent under the Agents cursor, if any. The cursor
+// indexes the display-ordered list (orderedAgents, grouped by template), so it
+// resolves to the row the user sees highlighted even when templates interleave.
 func (m Model) agentUnderCursor() (Agent, bool) {
-	visible := m.visibleAgents()
-	if pages[m.selected].page != pageAgents || m.agentCursor < 0 || m.agentCursor >= len(visible) {
+	ordered := m.orderedAgents()
+	if pages[m.selected].page != pageAgents || m.agentCursor < 0 || m.agentCursor >= len(ordered) {
 		return Agent{}, false
 	}
-	return visible[m.agentCursor], true
+	return ordered[m.agentCursor], true
+}
+
+// orderedAgents is the flat, display-ordered list of visible agents — the exact
+// top-to-bottom order rows render in (grouped by template, groups in
+// first-appearance order). The Agents cursor indexes into THIS slice so ↑/↓ steps
+// through the visible list in order.
+func (m Model) orderedAgents() []Agent {
+	var out []Agent
+	for _, g := range groupAgentsByTemplate(m.visibleAgents()) {
+		out = append(out, g.agents...)
+	}
+	return out
 }
 
 // isManagedTrainingAgent reports whether an agent name is internal skillopt
@@ -549,15 +563,27 @@ func (m Model) agentsContentInteractive() string {
 		return b.String()
 	}
 	var b strings.Builder
-	rows := [][]string{{"", "NAME", "RUNTIME", "ROLE", "HEALTH"}}
-	for i, a := range visible {
-		cursor, name := "  ", a.Name
-		if i == m.agentCursor {
-			cursor, name = "▸ ", selectedRowStyle.Render(a.Name)
+	// Render the visible agents grouped by template. The cursor indexes the
+	// display order (orderedAgents), so pos advances per agent row in lockstep
+	// and the highlight matches the visible position. The column header prints
+	// once at the top; template labels are display-only and consume no position.
+	b.WriteString(renderRows([][]string{{"", "NAME", "RUNTIME", "ROLE", "HEALTH"}}))
+	pos := 0
+	for _, g := range groupAgentsByTemplate(visible) {
+		b.WriteByte('\n')
+		b.WriteString(headerStyle.Render(agentGroupLabel(g.templateID)))
+		b.WriteByte('\n')
+		rows := [][]string{}
+		for _, a := range g.agents {
+			cursor, name := "  ", a.Name
+			if pos == m.agentCursor {
+				cursor, name = "▸ ", selectedRowStyle.Render(a.Name)
+			}
+			rows = append(rows, []string{cursor, name, a.Runtime, dash(a.Role), dash(a.Health)})
+			pos++
 		}
-		rows = append(rows, []string{cursor, name, a.Runtime, dash(a.Role), dash(a.Health)})
+		b.WriteString(renderRows(rows))
 	}
-	b.WriteString(renderRows(rows))
 	if m.agentErr != "" {
 		b.WriteString("\n" + errorStyle.Render(m.agentErr) + "\n")
 	}
@@ -571,6 +597,40 @@ func (m Model) agentsContentInteractive() string {
 	b.WriteString(mutedStyle.Render("enter detail  n new  o optimize  D delete"))
 	b.WriteByte('\n')
 	return b.String()
+}
+
+// agentGroupLabel is the section header for a template group; agents without a
+// template share the "(no template)" group.
+func agentGroupLabel(templateID string) string {
+	if strings.TrimSpace(templateID) == "" {
+		return "(no template)"
+	}
+	return templateID
+}
+
+// agentGroup is a template's agents in their original visible order.
+type agentGroup struct {
+	templateID string
+	agents     []Agent
+}
+
+// groupAgentsByTemplate buckets visible agents by TemplateID for display. Groups
+// appear in first-appearance order and agents keep their visible order within
+// each group. orderedAgents flattens these groups to define the cursor's index
+// space, so the display order and the selectable order are one and the same.
+func groupAgentsByTemplate(visible []Agent) []agentGroup {
+	groups := []agentGroup{}
+	at := map[string]int{} // templateID → index into groups
+	for _, a := range visible {
+		pos, ok := at[a.TemplateID]
+		if !ok {
+			pos = len(groups)
+			at[a.TemplateID] = pos
+			groups = append(groups, agentGroup{templateID: a.TemplateID})
+		}
+		groups[pos].agents = append(groups[pos].agents, a)
+	}
+	return groups
 }
 
 func (m Model) agentDetailView() string {

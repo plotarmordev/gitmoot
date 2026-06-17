@@ -103,6 +103,13 @@ func (m Model) updateJobOverlay(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if jobCancelable(m.activeJob.State) {
 				m.mode = modeConfirmJobCancel
 			}
+		default:
+			// Forward unmapped keys (↑/↓, pgup/pgdn, space, u/d) to the viewport
+			// so a long request/result/delegation list can be scrolled.
+			var cmd tea.Cmd
+			m.viewport, cmd = m.viewport.Update(msg)
+			m.viewport.SetContent(m.content())
+			return m, cmd
 		}
 		m.viewport.SetContent(m.content())
 		return m, nil
@@ -218,17 +225,6 @@ func daemonStartCmd(deps Deps) tea.Cmd {
 		}
 		return daemonStartMsg{err: deps.StartDaemon()}
 	}
-}
-
-// clampLines preserves newlines (unlike truncate, which collapses whitespace)
-// but caps the block to maxLines, appending an elision marker when it overflows.
-func clampLines(value string, maxLines int) string {
-	lines := strings.Split(strings.TrimRight(value, "\n"), "\n")
-	if len(lines) <= maxLines {
-		return strings.Join(lines, "\n")
-	}
-	kept := lines[:maxLines]
-	return strings.Join(kept, "\n") + "\n" + mutedStyle.Render("… "+strconv.Itoa(len(lines)-maxLines)+" more lines")
 }
 
 // jobDecisionColor colors a gitmoot_result decision: blocked/failed red,
@@ -366,13 +362,14 @@ func (m Model) jobDetailView() string {
 	b.WriteString(renderRows(rows))
 	b.WriteByte('\n')
 
-	// What was asked (newlines preserved, capped to a few lines).
+	// What was asked. Shown in full (newlines preserved) — the detail viewport
+	// scrolls, so the whole request is readable, not just the first lines.
 	if d.Request != "" {
 		b.WriteString(headerStyle.Render("request"))
 		b.WriteByte('\n')
-		b.WriteString(clampLines(d.Request, 8) + "\n\n")
+		b.WriteString(strings.TrimRight(d.Request, "\n") + "\n\n")
 	}
-	// What came back (settled jobs).
+	// What came back (settled jobs). Shown in full; the viewport scrolls.
 	if d.ResultDecision != "" || d.ResultSummary != "" {
 		b.WriteString(headerStyle.Render("result"))
 		b.WriteByte('\n')
@@ -380,7 +377,7 @@ func (m Model) jobDetailView() string {
 			b.WriteString("decision  " + jobDecisionColor(d.ResultDecision) + "\n")
 		}
 		if d.ResultSummary != "" {
-			b.WriteString(clampLines(d.ResultSummary, 8) + "\n")
+			b.WriteString(strings.TrimRight(d.ResultSummary, "\n") + "\n")
 		}
 		b.WriteByte('\n')
 	}

@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -16,12 +18,18 @@ func (m *Model) openTrainDetail() {
 	}
 }
 
-// trainUnderCursor returns the session under the Trains cursor, if any.
+// trainUnderCursor returns the session under the Trains cursor, if any. The
+// cursor indexes the display-ordered list (orderedTrains), not raw snapshot
+// order, so it resolves to the row the user sees highlighted.
 func (m Model) trainUnderCursor() (TrainSession, bool) {
-	if pages[m.selected].page != pageTrains || len(m.snap.Trains) == 0 {
+	if pages[m.selected].page != pageTrains {
 		return TrainSession{}, false
 	}
-	return m.snap.Trains[m.trainCursor], true
+	ordered := m.orderedTrains()
+	if m.trainCursor < 0 || m.trainCursor >= len(ordered) {
+		return TrainSession{}, false
+	}
+	return ordered[m.trainCursor], true
 }
 
 // openTrainStop enters the stop-reason overlay for a live session.
@@ -220,6 +228,125 @@ func (m Model) trainRepoCleanupView() string {
 	return b.String()
 }
 
+// Train status categories. A session lands in exactly one section; the ordering
+// of the constants is also the top-to-bottom render order of the sections.
+const (
+	trainCatActive = iota
+	trainCatBlocked
+	trainCatDone
+)
+
+var trainSectionTitles = map[int]string{
+	trainCatActive:  "Active",
+	trainCatBlocked: "Blocked",
+	trainCatDone:    "Done",
+}
+
+// trainStatusCategory buckets a phase into Active/Blocked/Done for the grouped
+// list. Blocked is checked before the broad Active default so a stalled
+// heartbeat or stale lock surfaces under Blocked rather than masquerading as
+// live work. Done covers the terminal states.
+func trainStatusCategory(phase string) int {
+	p := skillopt.NormalizeTrainState(phase)
+	switch p {
+	case skillopt.TrainStateRunAbandoned,
+		skillopt.TrainStateCandidatePromoted,
+		skillopt.TrainStateCandidateRejected,
+		skillopt.TrainStateOptimizerCompletedNoCandidate:
+		return trainCatDone
+	}
+	switch p {
+	case "blocked_stale_lock", "failed_unrecoverable", "blocked_config":
+		return trainCatBlocked
+	}
+	if strings.HasSuffix(p, "_heartbeat_stale") {
+		return trainCatBlocked
+	}
+	// Everything else — the ordered in-progress phases plus the live lock
+	// phases (generating_options/optimizer_running/preflight_running/
+	// recovery_available) — is Active.
+	return trainCatActive
+}
+
+// Only an explicit "-vN" suffix marks a version lineage. A bare "-N" (e.g. a
+// timestamp tail or an independently named run) is NOT treated as a version, so
+// unrelated sessions like nightly-1/nightly-2 do not collapse together.
+var trainLineageSuffix = regexp.MustCompile(`-v\d+$`)
+
+// trainLineageBase strips an explicit version suffix ("-v3") from a session id,
+// returning the shared base name and whether a suffix was present. Sessions in
+// the same status section that share a base collapse under one lineage line.
+func trainLineageBase(id string) (string, bool) {
+	loc := trainLineageSuffix.FindStringIndex(id)
+	if loc == nil {
+		return id, false
+	}
+	return id[:loc[0]], true
+}
+
+// trainGroup is one unit of the Trains display: either a lone session
+// (len(members)==1, base "") or a collapsed lineage (members share base).
+type trainGroup struct {
+	base    string
+	members []TrainSession
+}
+
+// trainSectionGroups returns the display-ordered groups for one status category.
+// Sessions are taken in snapshot order; a base shared by more than one session
+// in the category collapses into a single group whose members stay contiguous
+// (in snapshot order), emitted at the position of its first member. This keeps
+// every lineage child under its own parent even when members are not adjacent
+// in the snapshot.
+func (m Model) trainSectionGroups(cat int) []trainGroup {
+	var rows []TrainSession
+	for _, t := range m.snap.Trains {
+		if trainStatusCategory(t.Phase) == cat {
+			rows = append(rows, t)
+		}
+	}
+	counts := map[string]int{}
+	for _, t := range rows {
+		if base, ok := trainLineageBase(t.ID); ok {
+			counts[base]++
+		}
+	}
+	emitted := map[string]bool{}
+	var groups []trainGroup
+	for _, t := range rows {
+		base, ok := trainLineageBase(t.ID)
+		if ok && counts[base] > 1 {
+			if emitted[base] {
+				continue
+			}
+			emitted[base] = true
+			g := trainGroup{base: base}
+			for _, u := range rows {
+				if b, o := trainLineageBase(u.ID); o && b == base {
+					g.members = append(g.members, u)
+				}
+			}
+			groups = append(groups, g)
+			continue
+		}
+		groups = append(groups, trainGroup{members: []TrainSession{t}})
+	}
+	return groups
+}
+
+// orderedTrains is the flat, display-ordered list of sessions — the exact
+// top-to-bottom order rows render in (sections Active→Blocked→Done, lineages
+// contiguous). The Trains cursor indexes into THIS slice, so ↑/↓ steps through
+// the visible list in order and selection matches the highlighted row.
+func (m Model) orderedTrains() []TrainSession {
+	var out []TrainSession
+	for _, cat := range []int{trainCatActive, trainCatBlocked, trainCatDone} {
+		for _, g := range m.trainSectionGroups(cat) {
+			out = append(out, g.members...)
+		}
+	}
+	return out
+}
+
 func (m Model) trainsContent() string {
 	if m.mode == modeTrainDetail {
 		return m.trainDetail()
@@ -228,22 +355,57 @@ func (m Model) trainsContent() string {
 		return m.loadingOr("No train sessions.", !m.loadedAt.IsZero())
 	}
 	var b strings.Builder
-	for i, t := range m.snap.Trains {
-		cursor := "  "
-		phase := t.Phase
-		if deadTrainPhase(t.Phase) {
-			phase = mutedStyle.Render(t.Phase)
+
+	// pos is the display position of the next selectable session row; it must
+	// advance in lockstep with orderedTrains() so the cursor highlights and
+	// selects the same row. Section headers and lineage parents are display-only
+	// and consume no position.
+	pos := 0
+	first := true
+	for _, cat := range []int{trainCatActive, trainCatBlocked, trainCatDone} {
+		groups := m.trainSectionGroups(cat)
+		if len(groups) == 0 {
+			continue
 		}
-		line := t.ID + "  " + phase
-		if i == m.trainCursor {
-			cursor = "▸ "
-			line = selectedRowStyle.Render(t.ID) + "  " + phase
+		if !first {
+			b.WriteByte('\n')
 		}
-		b.WriteString(cursor + line + "\n")
+		first = false
+		b.WriteString(headerStyle.Render(trainSectionTitles[cat]))
+		b.WriteByte('\n')
+		for _, g := range groups {
+			if len(g.members) > 1 {
+				b.WriteString("  " + g.base + "  " + mutedStyle.Render("×"+strconv.Itoa(len(g.members))) + "\n")
+				for _, t := range g.members {
+					m.writeTrainRow(&b, t, pos == m.trainCursor, "    ")
+					pos++
+				}
+				continue
+			}
+			m.writeTrainRow(&b, g.members[0], pos == m.trainCursor, "  ")
+			pos++
+		}
 	}
+
 	b.WriteString(mutedStyle.Render("enter open  s stop  d delete"))
 	b.WriteByte('\n')
 	return b.String()
+}
+
+// writeTrainRow renders a single selectable session row at the given indent.
+// selected is true when this row's display position is under the cursor; the
+// cursor row replaces the trailing two spaces of indent with the "▸ " marker so
+// columns stay aligned.
+func (m Model) writeTrainRow(b *strings.Builder, t TrainSession, selected bool, indent string) {
+	phase := t.Phase
+	if deadTrainPhase(t.Phase) {
+		phase = mutedStyle.Render(t.Phase)
+	}
+	if selected {
+		b.WriteString(indent[:len(indent)-2] + "▸ " + selectedRowStyle.Render(t.ID) + "  " + phase + "\n")
+		return
+	}
+	b.WriteString(indent + t.ID + "  " + phase + "\n")
 }
 
 func (m Model) trainDetail() string {
