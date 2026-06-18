@@ -119,7 +119,10 @@ type Model struct {
 	sessionNotice      string  // muted note on the Sessions page (e.g. group not stoppable)
 
 	// Jobs page interaction state.
-	jobCursor         int                 // selected row in snap.JobRows
+	jobCursor int // selected row in jobsVisibleRows(); resolve to a job via
+	// selectedItemIndex(jobsVisibleRows(), jobCursor) -> jobsOrdered(), NOT
+	// snap.JobRows (grouping reorders by status and collapsed headers take slots).
+	jobGroups         []jobStatusGroup    // per-snapshot status grouping cache (see jobsByStatusGroup)
 	activeJob         JobRow              // job shown in detail / being confirmed
 	jobEvents         []JobEventView      // lazy-loaded event history for the detail view
 	jobEventsLoaded   bool                // the detail's event load has returned (possibly empty)
@@ -835,6 +838,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadErr = ""
 			m.snap = msg.snap
 			m.loadedAt = msg.at
+			m.jobGroups = computeJobsByStatusGroup(m.snap.JobRows)
 			m.clampPromptCursor()
 			m.clampTrainCursor()
 			m.clampJobCursor()
@@ -973,7 +977,7 @@ func (m *Model) pageCursor() (*int, int) {
 	case pageSessions:
 		return &m.sessionCursor, len(m.sessionRows())
 	case pageJobs:
-		return &m.jobCursor, len(m.snap.JobRows)
+		return &m.jobCursor, selectableCount(m.jobsVisibleRows())
 	case pageConfig:
 		return &m.configCursor, len(m.configEditableFields())
 	}
@@ -1010,6 +1014,8 @@ func (m Model) currentListRows() ([]listRow, bool) {
 		return m.attentionVisibleRows(), true
 	case pageTrains:
 		return m.trainVisibleRows(), true
+	case pageJobs:
+		return m.jobsVisibleRows(), true
 	}
 	return nil, false
 }
@@ -1073,6 +1079,7 @@ func (m *Model) toggleCurrentGroup() bool {
 	}
 	m.clampPromptCursor()
 	m.clampTrainCursor()
+	m.clampJobCursor()
 	return true
 }
 
@@ -1100,9 +1107,9 @@ func (m *Model) focusHeader(key string) {
 	}
 }
 
-// clampJobCursor keeps the Jobs cursor within the current job list.
+// clampJobCursor keeps the Jobs cursor within the current selectable rows.
 func (m *Model) clampJobCursor() {
-	m.jobCursor = clampCursor(m.jobCursor, len(m.snap.JobRows))
+	m.jobCursor = clampCursor(m.jobCursor, selectableCount(m.jobsVisibleRows()))
 }
 
 func loadSnapshot(deps Deps) tea.Cmd {

@@ -263,9 +263,14 @@ func (m Model) footerHelp() string {
 	case pageSessions:
 		return "tab/←→ page  ↑/↓ select  enter detail  s stop  ? help  q quit"
 	case pageJobs:
-		help := "tab/←→ page  ↑/↓ select  enter detail  R retry  c cancel"
-		if job, ok := m.jobUnderCursor(); ok && jobReportable(job.State) {
-			help += "  B report bug"
+		help := "tab/←→ page  ↑/↓ select  space open/close"
+		if m.cursorOnHeader() {
+			help += "  enter open/close"
+		} else {
+			help += "  enter detail  R retry  c cancel"
+			if job, ok := m.jobUnderCursor(); ok && jobReportable(job.State) {
+				help += "  B report bug"
+			}
 		}
 		return help + "  ? help  q quit"
 	case pageHealth:
@@ -420,6 +425,16 @@ func dash(value string) string {
 		return "-"
 	}
 	return value
+}
+
+// wrapText soft-wraps s to width columns (word-wrap, preserving existing
+// newlines) so long single-line content isn't clipped by the viewport's right
+// edge. A width <= 0 returns s unchanged.
+func wrapText(s string, width int) string {
+	if width <= 0 {
+		return s
+	}
+	return lipgloss.NewStyle().Width(width).Render(s)
 }
 
 // truncate collapses internal whitespace and shortens value to limit runes with

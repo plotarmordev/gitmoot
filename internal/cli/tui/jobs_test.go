@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func jobsSnapshot() Snapshot {
@@ -31,6 +32,22 @@ func jobsModel(t *testing.T, deps Deps, snap Snapshot) Model {
 	next, _ := m.Update(snapshotMsg{snap: snap, at: time.Unix(1, 0)})
 	m = next.(Model)
 	return tabToPage(t, m, pageJobs)
+}
+
+// selectJob walks the Jobs cursor down to the row for the given job id (the page
+// now groups jobs by status, so the cursor order is not snapshot order). Test
+// groups default to expanded, so every job is a reachable leaf.
+func selectJob(t *testing.T, m Model, id string) Model {
+	t.Helper()
+	for i := 0; i < 500; i++ {
+		if j, ok := m.jobUnderCursor(); ok && j.ID == id {
+			return m
+		}
+		next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = next.(Model)
+	}
+	t.Fatalf("could not move the Jobs cursor to %q", id)
+	return m
 }
 
 func TestFormatJobTime(t *testing.T) {
@@ -72,10 +89,14 @@ func TestJobsListWindowsLongList(t *testing.T) {
 	if cap >= 100 {
 		t.Fatalf("test needs a window smaller than the list; cap=%d", cap)
 	}
-	// Cursor at top: a "more" marker, no "earlier", and the last row is hidden.
+	// All 100 jobs are succeeded, so they fall under one status group (expanded in
+	// tests). Cursor at top: a "below" marker, no "above", and the last row hidden.
 	view := m.View()
-	if !strings.Contains(view, "more") || strings.Contains(view, "earlier") {
-		t.Fatalf("top of a long list should show only a 'more' marker:\n%s", view)
+	if !strings.Contains(view, "succeeded  ×100") {
+		t.Fatalf("jobs should group under a status header with a count:\n%s", view)
+	}
+	if !strings.Contains(view, "more rows below") || strings.Contains(view, "more rows above") {
+		t.Fatalf("top of a long list should show only a 'below' marker:\n%s", view)
 	}
 	if strings.Contains(view, "job-99 ") {
 		t.Fatalf("the far end should not render while the cursor is at the top")
@@ -89,8 +110,114 @@ func TestJobsListWindowsLongList(t *testing.T) {
 	if !strings.Contains(view, "job-99") {
 		t.Fatalf("the selected last job must be visible after scrolling:\n%s", view)
 	}
-	if !strings.Contains(view, "earlier") {
-		t.Fatalf("the bottom of a long list should show an 'earlier' marker:\n%s", view)
+	if !strings.Contains(view, "more rows above") {
+		t.Fatalf("the bottom of a long list should show an 'above' marker:\n%s", view)
+	}
+}
+
+// TestJobsGroupedByStatus verifies the Jobs list groups under status headers
+// (with ×counts) in active-first order, and that the cursor resolves through the
+// grouped order rather than snapshot order.
+func TestJobsGroupedByStatus(t *testing.T) {
+	m := jobsModel(t, Deps{}, jobsSnapshot())
+	view := m.View()
+	for _, want := range []string{"running  ×1", "failed  ×1", "succeeded  ×1", "cancelled  ×1"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("missing status header %q:\n%s", want, view)
+		}
+	}
+	// Active-first order: running before failed before succeeded before cancelled.
+	last := -1
+	for _, h := range []string{"running  ×1", "failed  ×1", "succeeded  ×1", "cancelled  ×1"} {
+		i := strings.Index(view, h)
+		if i < last {
+			t.Fatalf("status groups out of order at %q:\n%s", h, view)
+		}
+		last = i
+	}
+	// Cursor 0 is the first job in grouped order (running), not snapshot order.
+	if j, ok := m.jobUnderCursor(); !ok || j.ID != "j-running" {
+		t.Fatalf("cursor 0 should resolve to j-running (grouped order), got %+v ok=%v", j, ok)
+	}
+}
+
+// TestJobsCollapsedByDefault verifies the live default folds the status groups so
+// the page opens as status headers, and space expands one.
+func TestJobsCollapsedByDefault(t *testing.T) {
+	snap := jobsSnapshot()
+	deps := Deps{Load: func() (Snapshot, error) { return snap, nil }, CollapseGroupsByDefault: true}
+	m := sizedModel(deps)
+	next, _ := m.Update(snapshotMsg{snap: snap, at: time.Unix(1, 0)})
+	m = next.(Model)
+	m = tabToPage(t, m, pageJobs)
+	view := m.View()
+	if strings.Contains(view, "j-running") {
+		t.Fatalf("jobs should be folded under status headers by default:\n%s", view)
+	}
+	if !strings.Contains(view, "[+]") {
+		t.Fatalf("collapsed status group should show a [+] marker:\n%s", view)
+	}
+	// The cursor rests on a collapsed header, not a job.
+	if _, ok := m.jobUnderCursor(); ok {
+		t.Fatalf("cursor should be on a collapsed header, not a job")
+	}
+	// Space on the first collapsed header (running) expands it.
+	next, _ = m.Update(key(" "))
+	m = next.(Model)
+	if !strings.Contains(m.View(), "j-running") {
+		t.Fatalf("space should expand the running group and reveal j-running:\n%s", m.View())
+	}
+}
+
+// TestJobsWindowFitsViewport guards that, when both scroll markers show (cursor
+// mid-list), the windowed content fits inside the viewport so the "more rows
+// below" marker and the footer help are not clipped off the bottom.
+func TestJobsWindowFitsViewport(t *testing.T) {
+	snap := Snapshot{Daemon: Daemon{Running: true}}
+	for i := 0; i < 100; i++ {
+		snap.JobRows = append(snap.JobRows, JobRow{ID: "job-" + strconv.Itoa(i), Agent: "planner", Type: "ask", State: "succeeded"})
+	}
+	m := jobsModel(t, Deps{}, snap)
+	for i := 0; i < 50; i++ { // scroll into the middle → both markers present
+		next, _ := m.Update(key("j"))
+		m = next.(Model)
+	}
+	content := m.content()
+	if !strings.Contains(content, "more rows above") || !strings.Contains(content, "more rows below") {
+		t.Fatalf("mid-scroll should show both markers:\n%s", content)
+	}
+	lines := strings.Split(content, "\n")
+	idxOf := func(sub string) int {
+		for i, ln := range lines {
+			if strings.Contains(ln, sub) {
+				return i
+			}
+		}
+		return -1
+	}
+	// The below-marker and the footer help must land within the visible viewport.
+	for _, sub := range []string{"more rows below", "enter detail"} {
+		i := idxOf(sub)
+		if i < 0 || i >= m.viewport.Height {
+			t.Fatalf("%q at line %d is outside the %d-line viewport (would clip):\n%s", sub, i, m.viewport.Height, content)
+		}
+	}
+}
+
+// TestJobsWindowKeepsGroupContext guards that scrolling deep into a status group
+// (so its header scrolls off) keeps the group context on the "above" marker.
+func TestJobsWindowKeepsGroupContext(t *testing.T) {
+	snap := Snapshot{Daemon: Daemon{Running: true}}
+	for i := 0; i < 100; i++ {
+		snap.JobRows = append(snap.JobRows, JobRow{ID: "job-" + strconv.Itoa(i), Agent: "planner", Type: "ask", State: "succeeded"})
+	}
+	m := jobsModel(t, Deps{}, snap)
+	for i := 0; i < 60; i++ {
+		next, _ := m.Update(key("j"))
+		m = next.(Model)
+	}
+	if view := m.View(); !strings.Contains(view, "(continued)") {
+		t.Fatalf("deep cursor should keep the status-group context on the marker:\n%s", view)
 	}
 }
 
@@ -101,6 +228,7 @@ func TestJobsPageDetailLoadsEvents(t *testing.T) {
 		return []JobEventView{{Kind: "failed", Message: "boom"}}, nil
 	}}
 	m := jobsModel(t, deps, jobsSnapshot())
+	m = selectJob(t, m, "j-failed")
 	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(Model)
 	if m.mode != modeJobDetail || cmd == nil {
@@ -119,7 +247,7 @@ func TestJobsRetryConfirmFlow(t *testing.T) {
 	var retried string
 	deps := Deps{RetryJob: func(id string) error { retried = id; return nil }}
 	m := jobsModel(t, deps, jobsSnapshot())
-	// Cursor on j-failed (first row); R opens the confirm.
+	m = selectJob(t, m, "j-failed")
 	next, _ := m.Update(key("R"))
 	m = next.(Model)
 	if m.mode != modeConfirmJobRetry {
@@ -148,10 +276,8 @@ func TestJobsCancelRunningShowsCancelling(t *testing.T) {
 		CancelJob: func(id string) error { cancelled = id; return nil },
 	}
 	m := jobsModel(t, deps, snap)
-	// Move to the running job (row 2).
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m = next.(Model)
-	next, _ = m.Update(key("c"))
+	m = selectJob(t, m, "j-running")
+	next, _ := m.Update(key("c"))
 	m = next.(Model)
 	if m.mode != modeConfirmJobCancel {
 		t.Fatalf("c should confirm cancel, mode=%v", m.mode)
@@ -179,12 +305,8 @@ func TestJobsCancelRunningShowsCancelling(t *testing.T) {
 func TestJobsRetryOnNonRetryableIgnored(t *testing.T) {
 	deps := Deps{RetryJob: func(id string) error { t.Fatal("must not retry"); return nil }}
 	m := jobsModel(t, deps, jobsSnapshot())
-	// Move to the succeeded job (row 3).
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m = next.(Model)
-	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m = next.(Model)
-	next, _ = m.Update(key("R"))
+	m = selectJob(t, m, "j-done")
+	next, _ := m.Update(key("R"))
 	m = next.(Model)
 	if m.mode != modeNormal {
 		t.Fatalf("R on a succeeded job must be a no-op, mode=%v", m.mode)
@@ -212,6 +334,7 @@ func TestJobsBugReportPreviewCreateFlow(t *testing.T) {
 		},
 	}
 	m := jobsModel(t, deps, jobsSnapshot())
+	m = selectJob(t, m, "j-failed")
 	if !strings.Contains(m.View(), "B report bug") {
 		t.Fatalf("failed selected job should advertise report action:\n%s", m.View())
 	}
@@ -270,6 +393,7 @@ func TestJobsBugReportPreviewKeepsFooterVisibleForLongBody(t *testing.T) {
 		},
 	}
 	m := jobsModel(t, deps, jobsSnapshot())
+	m = selectJob(t, m, "j-failed")
 	next, cmd := m.Update(key("B"))
 	m = next.(Model)
 	next, _ = m.Update(cmd())
@@ -291,6 +415,7 @@ func TestJobsBugReportCreateErrorKeepsPreview(t *testing.T) {
 		},
 	}
 	m := jobsModel(t, deps, jobsSnapshot())
+	m = selectJob(t, m, "j-failed")
 	next, cmd := m.Update(key("B"))
 	m = next.(Model)
 	next, _ = m.Update(cmd())
@@ -317,6 +442,7 @@ func TestJobsBugReportExistingIssueLabel(t *testing.T) {
 		},
 	}
 	m := jobsModel(t, deps, jobsSnapshot())
+	m = selectJob(t, m, "j-failed")
 	next, cmd := m.Update(key("B"))
 	m = next.(Model)
 	next, _ = m.Update(cmd())
@@ -344,6 +470,7 @@ func TestJobsBugReportCreateResultNotDroppedAfterEsc(t *testing.T) {
 		},
 	}
 	m := jobsModel(t, deps, jobsSnapshot())
+	m = selectJob(t, m, "j-failed")
 	next, cmd := m.Update(key("B"))
 	m = next.(Model)
 	next, _ = m.Update(cmd())
@@ -367,6 +494,7 @@ func TestJobsBugReportBuildErrorKeepsPreview(t *testing.T) {
 		return BugReportPreview{}, errors.New("payload malformed")
 	}}
 	m := jobsModel(t, deps, jobsSnapshot())
+	m = selectJob(t, m, "j-failed")
 	next, cmd := m.Update(key("B"))
 	m = next.(Model)
 	next, _ = m.Update(cmd())
@@ -385,6 +513,7 @@ func TestJobsBugReportPreviewWithoutCreateDepDoesNotAdvertiseCreate(t *testing.T
 		return BugReportPreview{Title: "draft", Body: "body"}, nil
 	}}
 	m := jobsModel(t, deps, jobsSnapshot())
+	m = selectJob(t, m, "j-failed")
 	next, cmd := m.Update(key("B"))
 	m = next.(Model)
 	next, _ = m.Update(cmd())
@@ -407,8 +536,7 @@ func TestJobsBugReportIgnoredForNonReportableJob(t *testing.T) {
 		},
 	}
 	m := jobsModel(t, deps, jobsSnapshot())
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
-	m = next.(Model)
+	m = selectJob(t, m, "j-running")
 	if strings.Contains(m.View(), "B report bug") {
 		t.Fatalf("running selected job must not advertise report action:\n%s", m.View())
 	}
@@ -564,6 +692,7 @@ func TestJobDetailZeroEventsShowsNoEvents(t *testing.T) {
 func TestJobConfirmStaysOpenWhileActionInFlight(t *testing.T) {
 	deps := Deps{RetryJob: func(id string) error { return nil }}
 	m := jobsModel(t, deps, jobsSnapshot())
+	m = selectJob(t, m, "j-failed")
 	next, _ := m.Update(key("R"))
 	m = next.(Model)
 	next, cmd := m.Update(key("y"))
@@ -585,6 +714,7 @@ func TestJobConfirmStaysOpenWhileActionInFlight(t *testing.T) {
 func TestJobActionErrorKeepsConfirm(t *testing.T) {
 	deps := Deps{RetryJob: func(id string) error { return errors.New("db locked") }}
 	m := jobsModel(t, deps, jobsSnapshot())
+	m = selectJob(t, m, "j-failed")
 	next, _ := m.Update(key("R"))
 	m = next.(Model)
 	next, cmd := m.Update(key("y"))
@@ -637,6 +767,33 @@ func TestJobDetailShowsRequestAndResult(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Fatalf("job detail missing %q:\n%s", want, view)
 		}
+	}
+}
+
+// TestJobDetailWrapsLongResult guards that a long single-line result summary is
+// soft-wrapped to the viewport width instead of being clipped at the right edge.
+func TestJobDetailWrapsLongResult(t *testing.T) {
+	long := "Implementation blocked because the workspace is mounted read-only. " +
+		strings.Repeat("decrypt-failure replay-poisoning regression coverage ", 12) + "END_TOKEN"
+	deps := Deps{
+		JobEvents: func(id string) ([]JobEventView, error) { return nil, nil },
+		JobDetail: func(id string) (JobDetail, error) {
+			return JobDetail{ResultDecision: "blocked", ResultSummary: long}, nil
+		},
+	}
+	m := jobsModel(t, deps, jobsSnapshot())
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	m = drainBatch(t, m, cmd)
+	detail := m.jobDetailView()
+	for _, ln := range strings.Split(detail, "\n") {
+		if w := lipgloss.Width(ln); w > m.viewport.Width {
+			t.Fatalf("detail line width %d exceeds viewport %d (would clip): %q", w, m.viewport.Width, ln)
+		}
+	}
+	// The tail of the summary survives the wrap (it was clipped before the fix).
+	if !strings.Contains(detail, "END_TOKEN") {
+		t.Fatalf("wrapped summary should include its tail:\n%s", detail)
 	}
 }
 

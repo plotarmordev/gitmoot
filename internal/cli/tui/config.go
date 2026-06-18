@@ -20,6 +20,18 @@ func (m Model) configEditableFields() []ConfigField {
 	return fields
 }
 
+// configFieldEntity splits a 3+-part config KeyPath (e.g. [agents, <name>,
+// <setting>]) into the middle entity it belongs to and the leaf setting, so the
+// Config page can sub-group a section's editable fields under that entity (one
+// heading per agent instead of a flat "<agent> · <setting>" list). Shorter
+// KeyPaths return empty strings and render flat under their section.
+func configFieldEntity(f ConfigField) (entity, setting string) {
+	if len(f.KeyPath) >= 3 {
+		return f.KeyPath[1], f.KeyPath[len(f.KeyPath)-1]
+	}
+	return "", ""
+}
+
 // openConfigEdit enters the inline edit overlay for a scalar field.
 func (m *Model) openConfigEdit(field ConfigField) tea.Cmd {
 	m.configField = field
@@ -178,17 +190,41 @@ func (m Model) configContent() string {
 		b.WriteByte('\n')
 	}
 
-	// Inline-editable scalars as a cursor list (enter to change one).
-	fields := m.configEditableFields()
-	if len(fields) > 0 {
+	// Inline-editable scalars as a cursor list (enter to change one), grouped
+	// under their config section so related settings stay together. m.configCursor
+	// still indexes the flat configEditableFields() order — these same sections
+	// concatenated — so the running index stays in lockstep while the per-section
+	// sub-headers are display-only.
+	if len(m.configEditableFields()) > 0 {
 		b.WriteString(headerStyle.Render("editable settings"))
 		b.WriteByte('\n')
-		for i, field := range fields {
-			cursor, label := "  ", field.Label
-			if i == m.configCursor {
-				cursor, label = "▸ ", selectedRowStyle.Render(field.Label)
+		idx := 0
+		for _, section := range cv.Sections {
+			if len(section.Editable) == 0 {
+				continue
 			}
-			b.WriteString(cursor + label + "  " + mutedStyle.Render(dash(field.Value)) + "\n")
+			b.WriteString("  " + mutedStyle.Render(section.Title) + "\n")
+			curEntity := ""
+			for _, field := range section.Editable {
+				// Fields with an entity (e.g. each agent type) get a sub-heading so
+				// their settings group together; the redundant entity prefix is then
+				// dropped from the label.
+				entity, setting := configFieldEntity(field)
+				label, indent := field.Label, "    "
+				if entity != "" {
+					if entity != curEntity {
+						curEntity = entity
+						b.WriteString("    " + mutedStyle.Render(entity) + "\n")
+					}
+					label, indent = setting, "      "
+				}
+				cursor, shown := "  ", label
+				if idx == m.configCursor {
+					cursor, shown = "▸ ", selectedRowStyle.Render(label)
+				}
+				b.WriteString(indent + cursor + shown + "  " + mutedStyle.Render(dash(field.Value)) + "\n")
+				idx++
+			}
 		}
 		b.WriteByte('\n')
 	}
@@ -205,7 +241,7 @@ func (m Model) configContent() string {
 	}
 
 	hint := "e edit in $EDITOR · structural edits stay in the editor"
-	if len(fields) > 0 {
+	if len(m.configEditableFields()) > 0 {
 		hint = "↑/↓ select · enter change · " + hint
 	}
 	b.WriteString("\n" + mutedStyle.Render(hint))
