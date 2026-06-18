@@ -428,6 +428,9 @@ func openAgentVersionDetail(t *testing.T, deps Deps) Model {
 	if m.mode != modeAgentDetail {
 		t.Fatalf("expected modeAgentDetail, got %v", m.mode)
 	}
+	// Recent jobs precede versions in the detail cursor space; position on the
+	// first version for the version-preview tests.
+	m.agentDetailCursor = len(m.agentDetailJobs())
 	return m
 }
 
@@ -460,6 +463,211 @@ func TestAgentVersionPreviewLoadsAndRenders(t *testing.T) {
 	m = next.(Model)
 	if m.mode != modeAgentDetail {
 		t.Fatalf("esc should return to the detail, got %v", m.mode)
+	}
+}
+
+// TestAgentDetailRecentJobOpensAndReturns: in the agent detail, the recent jobs
+// are selectable; enter on one opens its job detail, and esc returns to the agent
+// detail (not the agents list).
+func TestAgentDetailRecentJobOpensAndReturns(t *testing.T) {
+	deps := Deps{TemplateVersions: func(string) ([]TemplateVersion, error) { return nil, nil }}
+	m := agentsModel(t, deps, agentsSnapshot()) // cursor 0 = planner (has job-1)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	if m.mode != modeAgentDetail {
+		t.Fatalf("expected agent detail, got %v", m.mode)
+	}
+	// Cursor 0 in the detail is planner's first recent job; enter opens it.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.mode != modeJobDetail || m.activeJob.ID != "job-1" {
+		t.Fatalf("enter on a recent job should open its detail, mode=%v job=%q", m.mode, m.activeJob.ID)
+	}
+	// esc returns to the agent detail, not the agents list.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.mode != modeAgentDetail {
+		t.Fatalf("esc from a job opened in the agent detail should return there, got %v", m.mode)
+	}
+}
+
+// TestAgentDetailJobActionsReturnToDetail covers the retry-confirm and
+// bug-report sub-flows from a job drilled in from the agent detail: each must
+// land back on the job detail (and then the agent detail) rather than dropping
+// to the agents list.
+func TestAgentDetailJobActionsReturnToDetail(t *testing.T) {
+	retried := ""
+	deps := Deps{
+		TemplateVersions: func(string) ([]TemplateVersion, error) { return nil, nil },
+		RetryJob:         func(id string) error { retried = id; return nil },
+		BugReportPreview: func(id string) (BugReportPreview, error) { return BugReportPreview{Title: "t"}, nil },
+	}
+	snap := agentsSnapshot()
+	// Give planner a single failed (retryable + reportable) recent job so the
+	// detail cursor lands on it.
+	snap.JobRows = []JobRow{{ID: "job-f", Agent: "planner", Type: "ask", State: "failed"}}
+	m := agentsModel(t, deps, snap)
+
+	open := func() Model {
+		// Unwind any open overlay back to the agents page first so the helper
+		// can be reused after a prior sub-flow.
+		for i := 0; i < 4 && m.mode != modeNormal; i++ {
+			next, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			m = next.(Model)
+		}
+		next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // agents page -> agent detail
+		m = next.(Model)
+		if cmd != nil {
+			next, _ = m.Update(cmd())
+			m = next.(Model)
+		}
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // agent detail -> job detail
+		m = next.(Model)
+		if m.mode != modeJobDetail || m.activeJob.ID != "job-f" {
+			t.Fatalf("enter should open job-f detail, mode=%v job=%q", m.mode, m.activeJob.ID)
+		}
+		return m
+	}
+
+	// R then y: retry dispatches and returns to the job detail, then esc to the
+	// agent detail.
+	m = open()
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("R")})
+	m = next.(Model)
+	if m.mode != modeConfirmJobRetry {
+		t.Fatalf("R should open the retry confirm, got %v", m.mode)
+	}
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	if retried != "job-f" {
+		t.Fatalf("retry should dispatch for job-f, got %q", retried)
+	}
+	if m.mode != modeJobDetail {
+		t.Fatalf("retry confirm should return to the job detail, got %v", m.mode)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.mode != modeAgentDetail {
+		t.Fatalf("esc after retry should return to the agent detail, got %v", m.mode)
+	}
+
+	// R then n (dismiss) also returns to the job detail.
+	m = open()
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("R")})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	m = next.(Model)
+	if m.mode != modeJobDetail {
+		t.Fatalf("dismissing the retry confirm should return to the job detail, got %v", m.mode)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+
+	// B then esc: bug-report preview returns to the job detail.
+	m = open()
+	next, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("B")})
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	if m.mode != modeBugReportPreview {
+		t.Fatalf("B should open the bug report preview, got %v", m.mode)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.mode != modeJobDetail {
+		t.Fatalf("esc from bug preview should return to the job detail, got %v", m.mode)
+	}
+}
+
+// TestAgentDetailScrollResetsOnReturn reproduces the shared-viewport scroll
+// leak: scrolling a job opened from the agent detail and pressing esc must land
+// the agent detail back at the top (showing its header), not stuck scrolled.
+func TestAgentDetailScrollResetsOnReturn(t *testing.T) {
+	// Many versions make the agent detail tall enough that a stale scroll offset
+	// would NOT be auto-clamped to zero on return — so this fails without the fix.
+	versions := make([]TemplateVersion, 30)
+	for i := range versions {
+		versions[i] = TemplateVersion{ID: "v" + strconv.Itoa(i+1), Number: i + 1, State: "superseded", Name: "T"}
+	}
+	deps := Deps{TemplateVersions: func(string) ([]TemplateVersion, error) { return versions, nil }}
+	snap := agentsSnapshot()
+	snap.JobRows = []JobRow{{ID: "job-f", Agent: "planner", Type: "ask", State: "succeeded"}}
+	m := agentsModel(t, deps, snap)
+
+	// Open the agent detail and drill into its recent job.
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if m.mode != modeJobDetail {
+		t.Fatalf("expected job detail, got %v", m.mode)
+	}
+
+	// Load a long request body and scroll the job detail down.
+	next, _ = m.Update(jobDetailMsg{id: "job-f", detail: JobDetail{Request: strings.Repeat("line\n", 200)}})
+	m = next.(Model)
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	m = next.(Model)
+	if m.viewport.YOffset == 0 {
+		t.Fatalf("job detail should have scrolled down")
+	}
+
+	// esc returns to the agent detail, which must be reset to the top.
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.mode != modeAgentDetail {
+		t.Fatalf("esc should return to the agent detail, got %v", m.mode)
+	}
+	if m.viewport.YOffset != 0 {
+		t.Fatalf("agent detail should reset to the top on return, YOffset=%d", m.viewport.YOffset)
+	}
+}
+
+// TestAgentDetailRecentJobsWindow guards that a busy agent's recent-jobs list
+// windows around the cursor so the detail stays scrollable.
+func TestAgentDetailRecentJobsWindow(t *testing.T) {
+	snap := Snapshot{Daemon: Daemon{Running: true}, Agents: []Agent{{Name: "busy", Runtime: "codex"}}}
+	for i := 0; i < 40; i++ {
+		snap.JobRows = append(snap.JobRows, JobRow{ID: "j-" + strconv.Itoa(i), Agent: "busy", Type: "ask", State: "succeeded"})
+	}
+	m := agentsModel(t, Deps{}, snap)
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // open busy's detail
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	view := m.View()
+	if !strings.Contains(view, "more") {
+		t.Fatalf("a long recent-jobs list should window with a 'more' marker:\n%s", view)
+	}
+	if strings.Contains(view, "j-39 ") {
+		t.Fatalf("the far end should not render while the cursor is at the top:\n%s", view)
+	}
+	for i := 0; i < 39; i++ {
+		next, _ := m.Update(key("j"))
+		m = next.(Model)
+	}
+	view = m.View()
+	if !strings.Contains(view, "j-39") {
+		t.Fatalf("the selected last job must be visible after scrolling:\n%s", view)
+	}
+	if !strings.Contains(view, "earlier") {
+		t.Fatalf("scrolled to the bottom, an 'earlier' marker should show:\n%s", view)
 	}
 }
 

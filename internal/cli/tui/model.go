@@ -168,7 +168,9 @@ type Model struct {
 	agentVersionsErr    string            // error from the version load
 	versionCursor       int               // selected row in the revert pick list
 	revertVersion       TemplateVersion   // version being confirmed for revert
-	detailVersionCursor int               // selected version row in the agent detail
+	agentDetailCursor   int               // selected row in the agent detail (recent jobs then versions)
+	jobDetailReturn     mode              // mode to return to when a job detail closes (modeNormal, or modeAgentDetail when opened from the agent detail)
+	jobActionReturn     mode              // mode to return to when a retry/cancel confirm or bug-report preview closes (captures whether it was opened from the page or a job detail)
 	runtimePickCursor   int               // selected runtime in the switch-runtime overlay
 	activeAgentVersion  TemplateVersion   // version shown in the content pager
 	versionView         viewport.Model    // pager for a version's content
@@ -216,6 +218,17 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(loadSnapshot(m.deps), tick(m.interval(), m.tickGen))
 }
 
+// scrollResetOnModeChange snaps the shared viewport back to the top when a key
+// handler changed the mode (opening, closing, or switching a modal overlay), so
+// a scroll position from one mode does not leak into the next.
+func scrollResetOnModeChange(prev mode, model tea.Model, cmd tea.Cmd) (tea.Model, tea.Cmd) {
+	if nm, ok := model.(Model); ok && nm.mode != prev {
+		nm.viewport.GotoTop()
+		return nm, cmd
+	}
+	return model, cmd
+}
+
 // Update satisfies tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
@@ -237,30 +250,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-			return m.updateJobOverlay(msg)
+			model, cmd := m.updateJobOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		case modeTrainStopReason, modeConfirmTrainDelete, modeConfirmTrainRepoCleanup:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-			return m.updateTrainOverlay(msg)
+			model, cmd := m.updateTrainOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		case modeAgentDetail, modeAgentRevertPick, modeConfirmAgentRevert, modeConfirmAgentDelete, modeConfirmAgentGroupDelete, modeAgentVersionView, modeAgentRuntimePick:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-			return m.updateAgentOverlay(msg)
+			model, cmd := m.updateAgentOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		case modeConfigEdit:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-			return m.updateConfigOverlay(msg)
+			model, cmd := m.updateConfigOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		case modeSessionDetail, modeConfirmSessionStop:
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-			return m.updateSessionOverlay(msg)
+			model, cmd := m.updateSessionOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		}
 		if m.mode != modeNormal {
-			return m.updateOverlay(msg)
+			model, cmd := m.updateOverlay(msg)
+			return scrollResetOnModeChange(m.mode, model, cmd)
 		}
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
@@ -710,7 +729,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.agentVersionsErr = ""
 				m.agentVersions = msg.versions
-				m.detailVersionCursor = clampCursor(m.detailVersionCursor, len(msg.versions))
+				m.agentDetailCursor = clampCursor(m.agentDetailCursor, m.agentDetailSelectableCount())
 			}
 		}
 	case versionContentMsg:
@@ -864,7 +883,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.err != nil {
 				m.actionErr = msg.err.Error()
 			} else {
-				m.mode = modeNormal
+				// Return to wherever the confirm was opened from: the page
+				// (modeNormal), or the job detail when drilled in from there.
+				m.mode = m.jobActionReturn
+				m.jobActionReturn = modeNormal
 				m.actionErr = ""
 			}
 		}
@@ -898,6 +920,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampJobCursor()
 			m.activityCursor = clampCursor(m.activityCursor, m.activitySelectableLen())
 			m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
+			m.agentDetailCursor = clampCursor(m.agentDetailCursor, m.agentDetailSelectableCount())
 			m.sessionCursor = clampCursor(m.sessionCursor, len(m.sessionRows()))
 			m.configCursor = clampCursor(m.configCursor, len(m.configEditableFields()))
 			// A cancel-requested job that has settled no longer needs the
