@@ -16,6 +16,7 @@ type page int
 
 const (
 	pageAttention page = iota
+	pageActivity
 	pageTrains
 	pageAgents
 	pageSessions
@@ -33,6 +34,7 @@ var pages = []struct {
 	title string
 }{
 	{pageAttention, "Attention", "Attention"},
+	{pageActivity, "Activity", "Activity — live agent work"},
 	{pageTrains, "Trains", "Trains"},
 	{pageAgents, "Agents", "Agents"},
 	{pageSessions, "Workers", "Runtime workers (agent sessions)"},
@@ -96,18 +98,19 @@ type Model struct {
 	expanded          map[string]bool
 	collapseByDefault bool
 
-	// Attention / Trains page interaction state.
-	mode         mode
-	promptCursor int                  // selected row in snap.Prompts on the Attention page
-	trainCursor  int                  // selected row in snap.Trains on the Trains page
-	active       db.InteractivePrompt // prompt being answered/dismissed in an overlay
-	activeTrain  TrainSession         // train shown in modeTrainDetail
-	choiceIdx    int                  // selected choice in modeAnswerChoice
-	input        textinput.Model      // free-text answer in modeAnswerText
-	actionErr    string               // inline error from the last Answer/Dismiss attempt
-	actionBusy   bool                 // an action is in flight; suppress re-submit
-	showHelp     bool                 // '?' help overlay
-	tickGen      int                  // current tick chain; stale generations are dropped
+	// Attention / Activity / Trains page interaction state.
+	mode           mode
+	promptCursor   int                  // selected row in snap.Prompts on the Attention page
+	activityCursor int                  // selected active root on the Activity page
+	trainCursor    int                  // selected row in snap.Trains on the Trains page
+	active         db.InteractivePrompt // prompt being answered/dismissed in an overlay
+	activeTrain    TrainSession         // train shown in modeTrainDetail
+	choiceIdx      int                  // selected choice in modeAnswerChoice
+	input          textinput.Model      // free-text answer in modeAnswerText
+	actionErr      string               // inline error from the last Answer/Dismiss attempt
+	actionBusy     bool                 // an action is in flight; suppress re-submit
+	showHelp       bool                 // '?' help overlay
+	tickGen        int                  // current tick chain; stale generations are dropped
 
 	// Sessions page interaction state.
 	sessionCursor      int     // selected row in sessionRows()
@@ -368,6 +371,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.openSessionDetail()
 				m.viewport.SetContent(m.content())
 				return m, tea.Batch(cmds...)
+			}
+			if r, ok := m.activityUnderCursor(); ok {
+				// Open the selected job's detail — a root coordinator (full request
+				// + delegation tree) or a delegate (the prompt it received + result).
+				cmd := m.openJobDetail(r)
+				m.viewport.SetContent(m.content())
+				return m, cmd
 			}
 			if agent, ok := m.agentUnderCursor(); ok {
 				cmd := m.openAgentDetail(agent)
@@ -828,6 +838,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampPromptCursor()
 			m.clampTrainCursor()
 			m.clampJobCursor()
+			m.activityCursor = clampCursor(m.activityCursor, m.activitySelectableLen())
 			m.agentCursor = clampCursor(m.agentCursor, len(m.visibleAgents()))
 			m.sessionCursor = clampCursor(m.sessionCursor, len(m.sessionRows()))
 			m.configCursor = clampCursor(m.configCursor, len(m.configEditableFields()))
@@ -953,6 +964,8 @@ func (m *Model) pageCursor() (*int, int) {
 	switch pages[m.selected].page {
 	case pageAttention:
 		return &m.promptCursor, selectableCount(m.attentionVisibleRows())
+	case pageActivity:
+		return &m.activityCursor, m.activitySelectableLen()
 	case pageTrains:
 		return &m.trainCursor, selectableCount(m.trainVisibleRows())
 	case pageAgents:

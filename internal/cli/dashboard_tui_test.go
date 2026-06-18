@@ -331,3 +331,133 @@ func TestDashboardCreateAgentWithPrompt(t *testing.T) {
 		t.Fatalf("template content = %q, want the edited prompt", tpl.Content)
 	}
 }
+
+func TestBuildDashboardActivity(t *testing.T) {
+	mustPayload := func(p workflow.JobPayload) string {
+		t.Helper()
+		raw, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		return string(raw)
+	}
+	jobs := []db.Job{
+		// Active root coordinator (no RootJobID → its own id is the root); its
+		// result names the two delegations.
+		{ID: "root-1", Agent: "planner", Type: "implement", State: "running", UpdatedAt: "2026-01-02T00:00:00Z",
+			Payload: mustPayload(workflow.JobPayload{Repo: "o/r", Result: &workflow.AgentResult{
+				Delegations: []workflow.Delegation{{ID: "d1", Action: "build"}, {ID: "d2", Action: "test"}},
+			}})},
+		{ID: "root-1/delegation/d1", Agent: "impl-a", Type: "implement", State: "running", ParentJobID: "root-1", DelegationID: "d1",
+			Payload: mustPayload(workflow.JobPayload{RootJobID: "root-1", ParentJobID: "root-1", DelegationID: "d1"})},
+		{ID: "root-1/delegation/d2", Agent: "impl-b", Type: "implement", State: "succeeded", ParentJobID: "root-1", DelegationID: "d2",
+			Payload: mustPayload(workflow.JobPayload{RootJobID: "root-1", ParentJobID: "root-1", DelegationID: "d2"})},
+		// A fully-settled tree (no active member) must be excluded.
+		{ID: "root-2", Agent: "planner", Type: "ask", State: "succeeded", UpdatedAt: "2026-01-01T00:00:00Z",
+			Payload: mustPayload(workflow.JobPayload{Repo: "o/x"})},
+	}
+	roots := buildDashboardActivity(jobs)
+	if len(roots) != 1 {
+		t.Fatalf("expected 1 active root, got %d: %+v", len(roots), roots)
+	}
+	r := roots[0]
+	if r.JobID != "root-1" || r.Repo != "o/r" || r.State != "running" {
+		t.Fatalf("root fields wrong: %+v", r)
+	}
+	if r.Total != 2 || r.Running != 1 || r.Blocked != 0 || r.Done != 1 {
+		t.Fatalf("progress counts wrong: total=%d running=%d blocked=%d done=%d", r.Total, r.Running, r.Blocked, r.Done)
+	}
+	if len(r.Children) != 2 {
+		t.Fatalf("expected 2 delegation children, got %d", len(r.Children))
+	}
+}
+
+// TestBuildDashboardActivityScopesActiveToDirectTree guards the consistency
+// invariant: a root's activeness is decided over the same scope the page renders
+// (root + direct children + continuation), so a surfaced tree always has visible
+// live work. A root whose only live work is a deeper grandchild (its direct
+// children all settled) is NOT surfaced — it would otherwise render a settled
+// coordinator with "0 running", which is what the page promises never to show.
+func TestBuildDashboardActivityScopesActiveToDirectTree(t *testing.T) {
+	mustPayload := func(p workflow.JobPayload) string {
+		t.Helper()
+		raw, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		return string(raw)
+	}
+	jobs := []db.Job{
+		// Tree A: a live continuation (a direct child) keeps the root surfaced even
+		// though the delegation child itself settled.
+		{ID: "a-root", Agent: "planner", Type: "implement", State: "succeeded", UpdatedAt: "2026-01-02T00:00:00Z",
+			Payload: mustPayload(workflow.JobPayload{Result: &workflow.AgentResult{
+				Delegations: []workflow.Delegation{{ID: "d1", Action: "build"}},
+			}})},
+		{ID: "a-root/delegation/d1", Agent: "impl", Type: "implement", State: "succeeded", ParentJobID: "a-root", DelegationID: "d1",
+			Payload: mustPayload(workflow.JobPayload{RootJobID: "a-root", ParentJobID: "a-root", DelegationID: "d1"})},
+		{ID: "a-root/continuation", Agent: "planner", Type: "ask", State: "running", ParentJobID: "a-root",
+			Payload: mustPayload(workflow.JobPayload{RootJobID: "a-root", ParentJobID: "a-root"})},
+
+		// Tree B: root + direct child both settled, but a grandchild (child of the
+		// sub-coordinator b-sub) is still running. The grandchild is not a direct
+		// child of b-root, so b-root must NOT be surfaced as live work.
+		{ID: "b-root", Agent: "planner", Type: "implement", State: "succeeded", UpdatedAt: "2026-01-03T00:00:00Z",
+			Payload: mustPayload(workflow.JobPayload{Result: &workflow.AgentResult{
+				Delegations: []workflow.Delegation{{ID: "s1", Action: "sub"}},
+			}})},
+		{ID: "b-sub", Agent: "coord", Type: "implement", State: "succeeded", ParentJobID: "b-root", DelegationID: "s1",
+			Payload: mustPayload(workflow.JobPayload{RootJobID: "b-root", ParentJobID: "b-root", DelegationID: "s1"})},
+		{ID: "b-grandchild", Agent: "impl", Type: "implement", State: "running", ParentJobID: "b-sub", DelegationID: "g1",
+			Payload: mustPayload(workflow.JobPayload{RootJobID: "b-root", ParentJobID: "b-sub", DelegationID: "g1"})},
+	}
+	roots := buildDashboardActivity(jobs)
+	if len(roots) != 1 {
+		t.Fatalf("expected only the continuation-live root, got %d: %+v", len(roots), roots)
+	}
+	r := roots[0]
+	if r.JobID != "a-root" {
+		t.Fatalf("surfaced root = %q, want a-root (b-root has no live direct child)", r.JobID)
+	}
+	if r.ContinuationID != "a-root/continuation" || r.ContinuationState != "running" {
+		t.Fatalf("continuation = (%q,%q), want (a-root/continuation, running)", r.ContinuationID, r.ContinuationState)
+	}
+}
+
+// TestBuildDashboardActivitySortsByTreeWideActivity guards that roots sort by the
+// freshest update anywhere in the tree, not the coordinator's own (frozen)
+// timestamp: a coordinator that settled earlier but has a child running right now
+// must rank above one that settled later with only stale children.
+func TestBuildDashboardActivitySortsByTreeWideActivity(t *testing.T) {
+	mustPayload := func(p workflow.JobPayload) string {
+		t.Helper()
+		raw, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		return string(raw)
+	}
+	jobs := []db.Job{
+		// coord-A settled at 09:00 but its child is running and was updated at 14:00.
+		{ID: "coord-A", Agent: "planner", Type: "implement", State: "succeeded", UpdatedAt: "2026-01-01T09:00:00Z",
+			Payload: mustPayload(workflow.JobPayload{Result: &workflow.AgentResult{
+				Delegations: []workflow.Delegation{{ID: "a1", Action: "x"}},
+			}})},
+		{ID: "coord-A/delegation/a1", Agent: "impl", Type: "implement", State: "running", UpdatedAt: "2026-01-01T14:00:00Z", ParentJobID: "coord-A", DelegationID: "a1",
+			Payload: mustPayload(workflow.JobPayload{ParentJobID: "coord-A", DelegationID: "a1"})},
+		// coord-B settled later (10:00) but its child only sits queued (10:30).
+		{ID: "coord-B", Agent: "planner", Type: "implement", State: "succeeded", UpdatedAt: "2026-01-01T10:00:00Z",
+			Payload: mustPayload(workflow.JobPayload{Result: &workflow.AgentResult{
+				Delegations: []workflow.Delegation{{ID: "b1", Action: "y"}},
+			}})},
+		{ID: "coord-B/delegation/b1", Agent: "impl", Type: "implement", State: "queued", UpdatedAt: "2026-01-01T10:30:00Z", ParentJobID: "coord-B", DelegationID: "b1",
+			Payload: mustPayload(workflow.JobPayload{ParentJobID: "coord-B", DelegationID: "b1"})},
+	}
+	roots := buildDashboardActivity(jobs)
+	if len(roots) != 2 {
+		t.Fatalf("want 2 active roots, got %d: %+v", len(roots), roots)
+	}
+	if roots[0].JobID != "coord-A" {
+		t.Fatalf("want coord-A first (freshest activity is its running child), got %q then %q", roots[0].JobID, roots[1].JobID)
+	}
+}
