@@ -2,6 +2,7 @@ package tui
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,99 @@ func agentsModel(t *testing.T, deps Deps, snap Snapshot) Model {
 	m = next.(Model)
 	m = tabToPage(t, m, pageAgents)
 	return m
+}
+
+// TestAgentsListWindowsLongList guards that a long agent list (e.g. with 'a'
+// showing many training agents) windows around the cursor so the selection stays
+// visible and the scroll markers appear — rather than overflowing unscrollably.
+func TestAgentsListWindowsLongList(t *testing.T) {
+	snap := Snapshot{Daemon: Daemon{Running: true}}
+	for i := 0; i < 80; i++ {
+		snap.Agents = append(snap.Agents, Agent{
+			Name: "agent-" + strconv.Itoa(i), Runtime: "codex", Role: "impl", Health: "ok", TemplateID: "tpl",
+		})
+	}
+	m := sizedModel(Deps{Load: func() (Snapshot, error) { return snap, nil }})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 24})
+	m = next.(Model)
+	next, _ = m.Update(snapshotMsg{snap: snap, at: time.Unix(1, 0)})
+	m = next.(Model)
+	m = tabToPage(t, m, pageAgents)
+
+	cap := agentsWindowCap(m.height)
+	if cap >= 80 {
+		t.Fatalf("test needs a window smaller than the list; cap=%d", cap)
+	}
+	// At the top: a "below" marker, no "above", and the far end hidden.
+	view := m.View()
+	if !strings.Contains(view, "more below") || strings.Contains(view, "more above") {
+		t.Fatalf("top of a long list should show only a 'below' marker:\n%s", view)
+	}
+	if strings.Contains(view, "agent-79 ") {
+		t.Fatalf("the far end should not render while the cursor is at the top:\n%s", view)
+	}
+	// Drive the cursor to the last agent; it must stay visible (window follows).
+	for i := 0; i < 79; i++ {
+		next, _ := m.Update(key("j"))
+		m = next.(Model)
+	}
+	view = m.View()
+	if !strings.Contains(view, "agent-79") {
+		t.Fatalf("the selected last agent must be visible after scrolling:\n%s", view)
+	}
+	if !strings.Contains(view, "more above") {
+		t.Fatalf("the bottom of a long list should show an 'above' marker:\n%s", view)
+	}
+}
+
+// TestAgentsHiddenLineShowsLiveCount verifies the hidden-agents line annotates how
+// many live sessions belong to hidden training agents (so the LIVE column isn't
+// silently empty when all live work is under hidden agents).
+func TestAgentsHiddenLineShowsLiveCount(t *testing.T) {
+	snap := agentsSnapshot()
+	snap.Agents = append(snap.Agents, Agent{Name: "skillopt-generator", Runtime: "codex"})
+	snap.Sessions = []Session{
+		{Name: "skillopt-generator-bg-1", Type: "skillopt-generator", Runtime: "codex", State: "running"},
+		{Name: "skillopt-generator-bg-2", Type: "skillopt-generator", Runtime: "codex", State: "idle"},
+	}
+	m := agentsModel(t, Deps{}, snap)
+	view := m.View()
+	if !strings.Contains(view, "1 training agents hidden") {
+		t.Fatalf("expected a hidden count:\n%s", view)
+	}
+	if !strings.Contains(view, "2 live") || !strings.Contains(view, "1 running") {
+		t.Fatalf("hidden line should annotate live/running session counts:\n%s", view)
+	}
+}
+
+// TestAgentsShowAllToggle verifies the 'a' key un-hides the training agents (and
+// hides them again), and that their LIVE counts then appear.
+func TestAgentsShowAllToggle(t *testing.T) {
+	snap := agentsSnapshot()
+	snap.Agents = append(snap.Agents, Agent{Name: "skillopt-generator", Runtime: "codex"})
+	snap.Sessions = []Session{
+		{Name: "skillopt-generator-bg-1", Type: "skillopt-generator", Runtime: "codex", State: "running"},
+	}
+	m := agentsModel(t, Deps{}, snap)
+	if strings.Contains(m.View(), "skillopt-generator") {
+		t.Fatalf("training agent should be hidden by default:\n%s", m.View())
+	}
+	// 'a' shows all.
+	next, _ := m.Update(key("a"))
+	m = next.(Model)
+	view := m.View()
+	if !strings.Contains(view, "skillopt-generator") {
+		t.Fatalf("'a' should reveal the hidden training agent:\n%s", view)
+	}
+	if !strings.Contains(view, "showing all agents") {
+		t.Fatalf("show-all mode should be indicated:\n%s", view)
+	}
+	// 'a' again hides them.
+	next, _ = m.Update(key("a"))
+	m = next.(Model)
+	if strings.Contains(m.View(), "skillopt-generator") {
+		t.Fatalf("'a' again should re-hide the training agent:\n%s", m.View())
+	}
 }
 
 func TestAgentsPageHidesTrainingAgents(t *testing.T) {
@@ -114,6 +208,63 @@ func TestAgentsPageGroupsByTemplate(t *testing.T) {
 			next, _ := m.Update(key("j"))
 			m = next.(Model)
 		}
+	}
+}
+
+// TestAgentDetailShowsLiveSessions verifies an agent's detail lists its live
+// runtime sessions (matched by owning agent — including temp workers, whose Type
+// carries a "temp:" prefix) and that the agent list shows the per-agent live
+// count, while another agent's sessions don't leak.
+func TestAgentDetailShowsLiveSessions(t *testing.T) {
+	snap := agentsSnapshot()
+	snap.Sessions = []Session{
+		{Name: "claude-bg-9f2", Type: "planner", Runtime: "claude", Repo: "o/r", State: "running", Expires: "2026-06-18T10:09:00Z"},
+		{Name: "claude-bg-1a7", Type: "planner", Runtime: "claude", Repo: "o/r", State: "idle", Expires: "2026-06-18T10:04:00Z"},
+		// A temp worker for planner: its Type carries the daemon's "temp:" prefix
+		// and must still roll up under planner.
+		{Name: "planner-temp-job9", Type: "temp:planner", Runtime: "claude", Repo: "o/r", State: "running"},
+		{Name: "codex-bg-77", Type: "reviewer", Runtime: "codex", Repo: "o/x", State: "running"},
+	}
+	m := agentsModel(t, Deps{}, snap)
+	// The list shows the per-agent live count column.
+	if !strings.Contains(m.View(), "LIVE") {
+		t.Fatalf("agent list should have a LIVE column:\n%s", m.View())
+	}
+	// Open planner's detail (cursor 0).
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	view := m.View()
+	for _, want := range []string{"live sessions", "claude-bg-9f2", "running", "claude-bg-1a7", "idle", "planner-temp-job9"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("planner detail missing %q:\n%s", want, view)
+		}
+	}
+	// reviewer's session must not appear under planner.
+	if strings.Contains(view, "codex-bg-77") {
+		t.Fatalf("another agent's session leaked into planner's detail:\n%s", view)
+	}
+}
+
+// TestAgentDetailNoLiveSessions shows the empty state when an agent has none.
+func TestAgentDetailNoLiveSessions(t *testing.T) {
+	m := agentsModel(t, Deps{}, agentsSnapshot()) // snapshot has no Sessions
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(Model)
+	if cmd != nil {
+		next, _ = m.Update(cmd())
+		m = next.(Model)
+	}
+	view := m.View()
+	idx := strings.Index(view, "live sessions")
+	if idx < 0 {
+		t.Fatalf("detail should have a live sessions section:\n%s", view)
+	}
+	if !strings.Contains(view[idx:], "none") {
+		t.Fatalf("an agent with no sessions should show none:\n%s", view[idx:])
 	}
 }
 

@@ -49,6 +49,9 @@ func isManagedTrainingAgent(name string) bool {
 // Agents page renders, cursors, and acts on this list; the serialized snapshot
 // keeps every agent, so --json/--plain are unaffected.
 func (m Model) visibleAgents() []Agent {
+	if m.showAllAgents {
+		return m.snap.Agents
+	}
 	out := make([]Agent, 0, len(m.snap.Agents))
 	for _, a := range m.snap.Agents {
 		if !isManagedTrainingAgent(a.Name) {
@@ -543,9 +546,39 @@ func choiceValues(choices []Choice) []string {
 func (m Model) agentsContentInteractive() string {
 	visible := m.visibleAgents()
 	hidden := len(m.snap.Agents) - len(visible)
+	// LIVE = warm runtime sessions per agent. Count once over all sessions (keyed
+	// by owning agent) so the render stays O(agents + sessions); also tally the
+	// sessions owned by hidden training agents to annotate the hidden line.
+	liveByAgent := map[string]int{}
+	hiddenLive, hiddenRunning := 0, 0
+	for _, s := range m.snap.Sessions {
+		name := sessionAgentName(s)
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		liveByAgent[name]++
+		if isManagedTrainingAgent(name) {
+			hiddenLive++
+			if s.State == "running" {
+				hiddenRunning++
+			}
+		}
+	}
 	hiddenLine := func(b *strings.Builder) {
+		if m.showAllAgents {
+			b.WriteString("\n" + mutedStyle.Render("showing all agents · a hide training") + "\n")
+			return
+		}
 		if hidden > 0 {
-			b.WriteString("\n" + mutedStyle.Render(strconv.Itoa(hidden)+" training agents hidden (skillopt-*)") + "\n")
+			line := strconv.Itoa(hidden) + " training agents hidden (skillopt-*)"
+			if hiddenLive > 0 {
+				line += " · " + strconv.Itoa(hiddenLive) + " live"
+				if hiddenRunning > 0 {
+					line += " (" + strconv.Itoa(hiddenRunning) + " running)"
+				}
+			}
+			line += " · a show all"
+			b.WriteString("\n" + mutedStyle.Render(line) + "\n")
 		}
 	}
 	if len(visible) == 0 {
@@ -567,22 +600,54 @@ func (m Model) agentsContentInteractive() string {
 	// display order (orderedAgents), so pos advances per agent row in lockstep
 	// and the highlight matches the visible position. The column header prints
 	// once at the top; template labels are display-only and consume no position.
-	b.WriteString(renderRows([][]string{{"", "NAME", "RUNTIME", "ROLE", "HEALTH"}}))
+	b.WriteString(renderRows([][]string{{"", "NAME", "RUNTIME", "ROLE", "HEALTH", "LIVE"}}))
+
+	// Build the group + agent lines once, then window them around the cursor so a
+	// long list (e.g. 'a' showing the training agents) stays scrollable with the
+	// selection on-screen. The column header above is always shown; agentCursor
+	// indexes the flat agent order.
+	var lines []string
+	cursorLine := 0
 	pos := 0
 	for _, g := range groupAgentsByTemplate(visible) {
-		b.WriteByte('\n')
-		b.WriteString(headerStyle.Render(agentGroupLabel(g.templateID)))
-		b.WriteByte('\n')
+		lines = append(lines, "", headerStyle.Render(agentGroupLabel(g.templateID)))
 		rows := [][]string{}
 		for _, a := range g.agents {
 			cursor, name := "  ", a.Name
 			if pos == m.agentCursor {
 				cursor, name = "▸ ", selectedRowStyle.Render(a.Name)
+				cursorLine = len(lines) + len(rows)
 			}
-			rows = append(rows, []string{cursor, name, a.Runtime, dash(a.Role), dash(a.Health)})
+			live := "-"
+			if n := liveByAgent[a.Name]; n > 0 {
+				live = strconv.Itoa(n)
+			}
+			rows = append(rows, []string{cursor, name, a.Runtime, dash(a.Role), dash(a.Health), live})
 			pos++
 		}
-		b.WriteString(renderRows(rows))
+		lines = append(lines, strings.Split(strings.TrimRight(renderRows(rows), "\n"), "\n")...)
+	}
+
+	capacity := agentsWindowCap(m.height)
+	start, end := 0, len(lines)
+	if len(lines) > capacity {
+		start = cursorLine - capacity/2
+		if start < 0 {
+			start = 0
+		}
+		if start > len(lines)-capacity {
+			start = len(lines) - capacity
+		}
+		end = start + capacity
+	}
+	if start > 0 {
+		b.WriteString(mutedStyle.Render("  ↑ "+strconv.Itoa(start)+" more above") + "\n")
+	}
+	for i := start; i < end; i++ {
+		b.WriteString(lines[i] + "\n")
+	}
+	if end < len(lines) {
+		b.WriteString(mutedStyle.Render("  ↓ "+strconv.Itoa(len(lines)-end)+" more below") + "\n")
 	}
 	if m.agentErr != "" {
 		b.WriteString("\n" + errorStyle.Render(m.agentErr) + "\n")
@@ -594,9 +659,19 @@ func (m Model) agentsContentInteractive() string {
 	if m.optimizeBusy {
 		b.WriteString("\n" + mutedStyle.Render("starting optimization…") + "\n")
 	}
-	b.WriteString(mutedStyle.Render("enter detail  n new  o optimize  D delete"))
+	b.WriteString(mutedStyle.Render("enter detail  n new  o optimize  D delete  a show all/hide"))
 	b.WriteByte('\n')
 	return b.String()
+}
+
+// agentsWindowCap is how many group/agent lines fit the Agents page, leaving
+// room for the viewport chrome (title, column header, scroll markers, the
+// hidden/all line, and the footer) so the windowed body stays on-screen.
+func agentsWindowCap(height int) int {
+	if height-12 < 3 {
+		return 3
+	}
+	return height - 12
 }
 
 // agentGroupLabel is the section header for a template group; agents without a
@@ -613,6 +688,38 @@ func agentGroupLabel(templateID string) string {
 type agentGroup struct {
 	templateID string
 	agents     []Agent
+}
+
+// tempWorkerTypePrefix is the prefix the daemon stamps on a temp worker's agent
+// type ("temp:<agent>", see tempWorkerAgentType). Stripping it rolls the temp
+// worker's session up under the agent it serves.
+const tempWorkerTypePrefix = "temp:"
+
+// sessionAgentName is the registered-agent name a runtime session belongs to: its
+// Type is the agent-type name (== the agent's Name), with the temp-worker
+// "temp:" prefix stripped so a parallel temp worker counts toward the agent it
+// serves rather than disappearing from the Agents view.
+func sessionAgentName(s Session) string {
+	if rest, ok := strings.CutPrefix(s.Type, tempWorkerTypePrefix); ok {
+		return rest
+	}
+	return s.Type
+}
+
+// agentSessions returns the live runtime sessions belonging to an agent (the same
+// warm process can serve any agent of that type, including its temp workers).
+// Order is preserved from the snapshot.
+func agentSessions(sessions []Session, agentName string) []Session {
+	if strings.TrimSpace(agentName) == "" {
+		return nil
+	}
+	var out []Session
+	for _, s := range sessions {
+		if sessionAgentName(s) == agentName {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // groupAgentsByTemplate buckets visible agents by TemplateID for display. Groups
@@ -656,6 +763,27 @@ func (m Model) agentDetailView() string {
 	} else {
 		for _, job := range jobs {
 			b.WriteString(job.ID + "  " + job.Type + "  " + jobStateColor(job.State) + "\n")
+		}
+	}
+	b.WriteByte('\n')
+
+	// Live runtime sessions (warm processes) serving this agent. Ephemeral — they
+	// expire on idle — so they live here as a drill-in snapshot, not in the list.
+	b.WriteString(headerStyle.Render("live sessions"))
+	b.WriteByte('\n')
+	sessions := agentSessions(m.snap.Sessions, a.Name)
+	if len(sessions) == 0 {
+		b.WriteString(mutedStyle.Render("none") + "\n")
+	} else {
+		for _, s := range sessions {
+			line := s.Name + "  " + s.State
+			if s.Repo != "" {
+				line += "  " + s.Repo
+			}
+			if s.Expires != "" {
+				line += "  " + mutedStyle.Render("expires "+formatJobTime(s.Expires))
+			}
+			b.WriteString(line + "\n")
 		}
 	}
 	b.WriteByte('\n')
