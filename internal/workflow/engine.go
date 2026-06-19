@@ -334,6 +334,18 @@ func (e Engine) AdvanceJob(ctx context.Context, jobID string) error {
 	// pending retries). No-op for jobs that did not allocate a read-only worktree.
 	defer e.cleanupReadOnlyDelegationWorktree(ctx, jobID, job.Type, payload)
 
+	// Commit a succeeded implement leg's work to its own branch BEFORE advancing
+	// the parent's delegation DAG. The parent advance below may enqueue a dependent
+	// that integrates this leg (#332); if the commit ran later (in the switch), the
+	// leg that *triggered* the integration would not yet be on its branch and its
+	// work would be missing from the merge. The task/PR finalizer path commits its
+	// own way, so this only covers PR-less delegation legs; it is a no-op otherwise.
+	if job.Type == "implement" && payload.Result.Decision == "implemented" && !e.implementationNeedsFinalizer(ctx, payload) {
+		if err := e.commitDelegationLeg(ctx, job, payload); err != nil {
+			return err
+		}
+	}
+
 	// When a delegated child job finishes, advance its parent's delegation DAG
 	// before running the child's own advancement: enqueue any now-ready
 	// dependent siblings, apply the failed delegation's failure_policy, and
@@ -875,6 +887,80 @@ func (e Engine) enqueueDelegation(ctx context.Context, job db.Job, payload JobPa
 	return e.allocateAndEnqueueDelegation(ctx, job, payload, d, request, ref)
 }
 
+// integrationDepBranches returns the per-delegation branches of delegation d's
+// succeeded implement-leg dependencies, so a dependent read-only step (e.g. a
+// decompose-and-verify verify gate) can run against a worktree with those legs
+// merged in rather than the base checkout (issue #332). It returns nil when d has
+// no such deps, in which case the normal read-only paths apply. Read-only deps
+// contribute no branch (they produce no implementation), and a leg that ran in
+// the shared checkout (branch == parent base) is skipped (its work is already on
+// the base).
+func (e Engine) integrationDepBranches(ctx context.Context, job db.Job, payload JobPayload, d Delegation) ([]string, error) {
+	deps := compactStrings(d.Deps)
+	if len(deps) == 0 || payload.Result == nil {
+		return nil, nil
+	}
+	byID := make(map[string]Delegation, len(payload.Result.Delegations))
+	for _, sib := range payload.Result.Delegations {
+		byID[strings.TrimSpace(sib.ID)] = sib
+	}
+	// Resolve each dep to its winning child job the same way advanceDelegations
+	// does (latest attempt per delegation id), so a leg that succeeded on a retry
+	// contributes its retry branch rather than the failed original.
+	children, err := e.childDelegationJobs(ctx, job.ID)
+	if err != nil {
+		return nil, err
+	}
+	base := strings.TrimSpace(payload.Branch)
+	var branches []string
+	for _, dep := range deps {
+		sib, ok := byID[dep]
+		if !ok || readOnlyDelegationAction(sib.Action) {
+			continue
+		}
+		legJob, ok := children[dep]
+		if !ok || legJob.State != string(JobSucceeded) {
+			continue
+		}
+		legPayload, err := unmarshalPayload(legJob.Payload)
+		if err != nil {
+			return nil, err
+		}
+		if legBranch := strings.TrimSpace(legPayload.Branch); legBranch != "" && legBranch != base {
+			branches = append(branches, legBranch)
+		}
+	}
+	return branches, nil
+}
+
+// commitDelegationLeg commits an implement delegation leg's worktree changes to
+// its own branch when the leg has its own per-delegation worktree but no task/PR
+// finalizer (a PR-less local orchestrate, where the finalizer never runs and the
+// edits would otherwise stay uncommitted). This makes the leg's work available on
+// its branch for a dependent integration step (#332). It is a no-op for jobs with
+// no delegation worktree, a clean worktree, or a manager that cannot commit.
+func (e Engine) commitDelegationLeg(ctx context.Context, job db.Job, payload JobPayload) error {
+	if strings.TrimSpace(payload.DelegationID) == "" || strings.TrimSpace(payload.WorktreePath) == "" {
+		return nil
+	}
+	committer, ok := e.DelegationWorktrees.(WorktreeCommitter)
+	if !ok {
+		return nil
+	}
+	committed, err := committer.CommitWorktree(ctx, payload.WorktreePath, fmt.Sprintf("Gitmoot delegation %s implementation", payload.DelegationID))
+	if err != nil {
+		return err
+	}
+	if committed {
+		_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+			JobID:   job.ID,
+			Kind:    "delegation_committed",
+			Message: fmt.Sprintf("delegation %q committed its implementation to branch %s", payload.DelegationID, payload.Branch),
+		})
+	}
+	return nil
+}
+
 // allocateAndEnqueueDelegation allocates the per-delegation worktree (or branch
 // lock) for implement delegations and enqueues the prepared request, recording a
 // delegation_enqueued event. It is shared by enqueueDelegation (initial/deferred
@@ -924,6 +1010,46 @@ func (e Engine) allocateAndEnqueueDelegation(ctx context.Context, job db.Job, pa
 			// inherited HeadSHA so the child validates against its own fresh
 			// worktree HEAD instead of a stale parent SHA.
 			request.HeadSHA = ""
+		}
+	} else if legBranches, err := e.integrationDepBranches(ctx, job, payload, d); err != nil {
+		return err
+	} else if len(legBranches) > 0 {
+		// This read-only delegation (e.g. a decompose-and-verify verify gate) depends
+		// on succeeded implement legs that each live on their own branch. Merge them
+		// into one detached worktree so the dependent sees the combined work instead
+		// of the base checkout (#332).
+		if manager, ok := e.DelegationWorktrees.(IntegrationWorktreeManager); !ok || strings.TrimSpace(e.Home) == "" {
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    "delegation_worktree_skipped",
+				Message: fmt.Sprintf("delegation %q runs against the base checkout: integration worktree unavailable", request.DelegationID),
+			})
+		} else {
+			path, err := e.AllocateIntegrationWorktree(ctx, DelegationWorktreeRequest{
+				Home:         e.Home,
+				Repo:         request.Repo,
+				ParentJobID:  job.ID,
+				DelegationID: request.DelegationID,
+				BaseBranch:   payload.Branch,
+				Checkout:     e.DelegationCheckout,
+				RetryAttempt: request.RetryCount,
+			}, legBranches, manager)
+			if err != nil {
+				var blocked BlockedError
+				if errors.As(err, &blocked) {
+					return e.block(ctx, ref, blocked.Reason)
+				}
+				return err
+			}
+			request.WorktreePath = path
+			// Validate against the integration worktree's own HEAD, not the inherited
+			// parent HeadSHA (see isDelegationWorktreeChild).
+			request.HeadSHA = ""
+			_ = e.Store.AddJobEvent(ctx, db.JobEvent{
+				JobID:   job.ID,
+				Kind:    "delegation_integrated",
+				Message: fmt.Sprintf("delegation %q runs in an integration worktree merging %d implement leg(s)", request.DelegationID, len(legBranches)),
+			})
 		}
 	} else if readOnlyFanoutNeedsWorktree(payload, d) {
 		// Read-only fan-out: >=2 read-only siblings share the parent repo and would

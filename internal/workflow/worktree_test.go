@@ -623,6 +623,16 @@ type fakeWorktreeManager struct {
 	detachedCalls    []worktreeCall // AddDetachedWorktree: path in .path, ref in .base
 	removedForce     []string       // RemoveWorktreeForce paths
 	removeErr        error
+	mergeCalls       []mergeCall // MergeBranches calls
+	mergeErr         error
+	committedDirs    []string // CommitWorktree dirs
+	commitMade       bool     // value CommitWorktree returns for "committed"
+	commitErr        error
+}
+
+type mergeCall struct {
+	dir      string
+	branches []string
 }
 
 type worktreeCall struct {
@@ -657,6 +667,16 @@ func (f *fakeWorktreeManager) AddDetachedWorktree(_ context.Context, path string
 	}
 	f.detachedCalls = append(f.detachedCalls, worktreeCall{path: path, base: ref})
 	return f.err
+}
+
+func (f *fakeWorktreeManager) MergeBranches(_ context.Context, dir string, branches []string, _ string) error {
+	f.mergeCalls = append(f.mergeCalls, mergeCall{dir: dir, branches: branches})
+	return f.mergeErr
+}
+
+func (f *fakeWorktreeManager) CommitWorktree(_ context.Context, dir string, _ string) (bool, error) {
+	f.committedDirs = append(f.committedDirs, dir)
+	return f.commitMade, f.commitErr
 }
 
 func (f *fakeWorktreeManager) RemoveWorktreeForce(_ context.Context, path string) error {

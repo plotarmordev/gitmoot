@@ -37,6 +37,24 @@ type ReadOnlyWorktreeManager interface {
 	RemoveWorktreeForce(ctx context.Context, path string) error
 }
 
+// IntegrationWorktreeManager builds a detached worktree off the parent base and
+// merges the per-delegation branches of succeeded implement legs into it, so a
+// dependent verify/review step sees the legs' combined work instead of the base
+// checkout (issue #332). The detached worktree carries no branch and no branch
+// lock, so it is disposed by the same read-only cleanup as fan-out worktrees.
+type IntegrationWorktreeManager interface {
+	AddDetachedWorktree(ctx context.Context, path string, ref string) error
+	MergeBranches(ctx context.Context, dir string, branches []string, message string) error
+}
+
+// WorktreeCommitter commits an implement delegation leg's work to its own branch
+// on success, so the leg's changes are available on its branch for a dependent
+// integration step (#332) even in a PR-less local orchestrate where the task/PR
+// finalizer never runs. The checkout-bound gitutil.Client satisfies it.
+type WorktreeCommitter interface {
+	CommitWorktree(ctx context.Context, dir string, message string) (bool, error)
+}
+
 type TaskWorktreeRequest struct {
 	Home       string
 	Repo       string
@@ -286,6 +304,62 @@ func (e Engine) AllocateReadOnlyDelegationWorktree(ctx context.Context, request 
 	}()
 	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
 		return "", err
+	}
+	return path, nil
+}
+
+// AllocateIntegrationWorktree creates a detached worktree off the parent base
+// branch and sequentially merges the given succeeded implement-leg branches into
+// it, so a dependent read-only step (a decompose-and-verify verify gate) sees the
+// legs' combined work rather than the base checkout (issue #332). The worktree is
+// keyed on a synthetic "integration-<delegation-id>" so it never collides with
+// the dependent's own id, carries no branch/branch lock, and is disposed by the
+// same read-only cleanup as fan-out worktrees. A merge conflict means the
+// decomposition was not actually file-disjoint: it is returned as a BlockedError
+// so the caller blocks the parent rather than auto-resolving.
+func (e Engine) AllocateIntegrationWorktree(ctx context.Context, request DelegationWorktreeRequest, legBranches []string, manager IntegrationWorktreeManager) (string, error) {
+	if err := e.validate(); err != nil {
+		return "", err
+	}
+	if manager == nil {
+		return "", errors.New("integration worktree manager is required")
+	}
+	if strings.TrimSpace(request.ParentJobID) == "" {
+		return "", errors.New("delegation worktree parent job id is required")
+	}
+	if strings.TrimSpace(request.DelegationID) == "" {
+		return "", errors.New("delegation worktree delegation id is required")
+	}
+	if len(legBranches) == 0 {
+		return "", errors.New("integration worktree requires at least one leg branch")
+	}
+	integrationID := "integration-" + request.DelegationID
+	path, err := DelegationWorktreePath(request.Home, request.Repo, request.ParentJobID, integrationID, request.RetryAttempt)
+	if err != nil {
+		return "", err
+	}
+	ref := strings.TrimSpace(request.BaseBranch)
+	if ref == "" {
+		ref = "HEAD"
+	}
+	releaseCheckoutLock, _, err := acquireCheckoutMutationLockWithWait(ctx, e.Store, request.Checkout, "worktree:"+request.ParentJobID+"/"+integrationID, time.Now().UTC())
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if releaseCheckoutLock != nil {
+			_ = releaseCheckoutLock(context.Background())
+		}
+	}()
+	// A delegation is dispatched once (advanceDelegations skips already-enqueued
+	// dependents; retries use a retry-suffixed path), so allocate a fresh detached
+	// worktree like the implement and read-only paths rather than reusing one.
+	if err := manager.AddDetachedWorktree(ctx, path, ref); err != nil {
+		return "", err
+	}
+	msg := "Gitmoot integration merge for delegation " + request.DelegationID
+	if err := manager.MergeBranches(ctx, path, legBranches, msg); err != nil {
+		return "", BlockedError{Reason: fmt.Sprintf("integration merge for delegation %q failed (decomposition is not file-disjoint): %v", request.DelegationID, err)}
 	}
 	return path, nil
 }

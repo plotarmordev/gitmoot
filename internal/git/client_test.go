@@ -184,6 +184,129 @@ func TestClientRemoveWorktreeForceSmoke(t *testing.T) {
 	}
 }
 
+func TestClientMergeBranchesCommandConstruction(t *testing.T) {
+	runner := &fakeRunner{results: []subprocess.Result{{}, {}}}
+	client := Client{Runner: runner, Dir: "/repo"}
+	if err := client.MergeBranches(context.Background(), "/wt/integration", []string{"legA", "legB"}, "integrate"); err != nil {
+		t.Fatalf("MergeBranches returned error: %v", err)
+	}
+	runner.wantArgs(t, 0, "git", "merge", "--no-edit", "-m", "integrate", "legA")
+	runner.wantArgs(t, 1, "git", "merge", "--no-edit", "-m", "integrate", "legB")
+}
+
+func TestClientMergeBranchesAbortsAndNamesConflictingBranch(t *testing.T) {
+	runner := &fakeRunner{errs: []error{nil, errors.New("CONFLICT")}}
+	client := Client{Runner: runner, Dir: "/repo"}
+	err := client.MergeBranches(context.Background(), "/wt/integration", []string{"legA", "legB"}, "integrate")
+	if err == nil {
+		t.Fatal("expected error when a leg merge conflicts")
+	}
+	if !strings.Contains(err.Error(), "legB") {
+		t.Fatalf("error must name the conflicting branch: %v", err)
+	}
+	last := runner.calls[len(runner.calls)-1]
+	if len(last) < 3 || last[1] != "merge" || last[2] != "--abort" {
+		t.Fatalf("expected a 'merge --abort' after conflict, got %v", last)
+	}
+	if err := (Client{}).MergeBranches(context.Background(), " ", []string{"legA"}, "m"); err == nil {
+		t.Fatal("MergeBranches accepted an empty dir")
+	}
+	if err := (Client{Runner: &fakeRunner{}}).MergeBranches(context.Background(), "/wt", []string{"bad branch"}, "m"); err == nil {
+		t.Fatal("MergeBranches accepted an unsafe branch name")
+	}
+}
+
+func TestClientMergeBranchesSmoke(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "base")
+	// Two file-disjoint legs off main.
+	runGit(t, dir, "checkout", "-b", "legA")
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("A\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile a.txt returned error: %v", err)
+	}
+	runGit(t, dir, "add", "a.txt")
+	runGit(t, dir, "commit", "-m", "legA")
+	runGit(t, dir, "checkout", "main")
+	runGit(t, dir, "checkout", "-b", "legB")
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("B\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile b.txt returned error: %v", err)
+	}
+	runGit(t, dir, "add", "b.txt")
+	runGit(t, dir, "commit", "-m", "legB")
+	runGit(t, dir, "checkout", "main")
+
+	client := Client{Dir: dir}
+	wt := filepath.Join(t.TempDir(), "integration")
+	if err := client.AddDetachedWorktree(context.Background(), wt, "main"); err != nil {
+		t.Fatalf("AddDetachedWorktree returned error: %v", err)
+	}
+	if err := client.MergeBranches(context.Background(), wt, []string{"legA", "legB"}, "integrate"); err != nil {
+		t.Fatalf("MergeBranches returned error: %v", err)
+	}
+	// The integration worktree must now contain BOTH legs' files.
+	for _, f := range []string{"a.txt", "b.txt"} {
+		if _, err := os.Stat(filepath.Join(wt, f)); err != nil {
+			t.Fatalf("%s missing from integration worktree after merge: %v", f, err)
+		}
+	}
+}
+
+func TestClientCommitWorktreeSmoke(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dir := t.TempDir()
+	runGit(t, dir, "init", "-b", "main")
+	runGit(t, dir, "config", "user.email", "gitmoot@example.com")
+	runGit(t, dir, "config", "user.name", "Gitmoot")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# base\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	runGit(t, dir, "add", "README.md")
+	runGit(t, dir, "commit", "-m", "base")
+
+	client := Client{Dir: dir}
+	// Clean worktree -> no commit.
+	committed, err := client.CommitWorktree(context.Background(), dir, "noop")
+	if err != nil {
+		t.Fatalf("CommitWorktree(clean) returned error: %v", err)
+	}
+	if committed {
+		t.Fatal("CommitWorktree reported a commit for a clean worktree")
+	}
+	// Edit -> commit.
+	if err := os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("work\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile feature.txt returned error: %v", err)
+	}
+	committed, err = client.CommitWorktree(context.Background(), dir, "add feature")
+	if err != nil {
+		t.Fatalf("CommitWorktree(edit) returned error: %v", err)
+	}
+	if !committed {
+		t.Fatal("CommitWorktree did not commit a dirty worktree")
+	}
+	clean, err := client.WorktreeClean(context.Background())
+	if err != nil {
+		t.Fatalf("WorktreeClean returned error: %v", err)
+	}
+	if !clean {
+		t.Fatal("worktree should be clean after CommitWorktree")
+	}
+	if _, err := (Client{}).CommitWorktree(context.Background(), " ", "m"); err == nil {
+		t.Fatal("CommitWorktree accepted an empty dir")
+	}
+}
+
 func TestClientBranchExistsReturnsFalseForMissingBranch(t *testing.T) {
 	runner := &fakeRunner{errs: []error{errors.New("exit status 1")}}
 	exists, err := (Client{Runner: runner, Dir: "/repo"}).BranchExists(context.Background(), "missing")
