@@ -2046,6 +2046,48 @@ func TestEngineContinuationCarriesParentModel(t *testing.T) {
 	}
 }
 
+// TestEngineContinuationInheritsCockpit guards that a coordinator's cockpit
+// settings carry into the post-synthesis continuation so the continuation
+// renders its pane under the same workspace/session as the rest of the tree.
+func TestEngineContinuationInheritsCockpit(t *testing.T) {
+	ctx := context.Background()
+	store := openEngineStore(t)
+	seedAgent(t, store, "coord", []string{"ask"}, "plotarmordev/gitmoot")
+	seedAgent(t, store, "api", []string{"review"}, "plotarmordev/gitmoot")
+	engine := testEngine(store)
+
+	insertCompletedJob(t, store, db.Job{ID: "parent-job", Agent: "coord", Type: "ask"}, JobPayload{
+		Repo:           "plotarmordev/gitmoot",
+		Branch:         "task-005",
+		Sender:         "coord",
+		Cockpit:        true,
+		CockpitSession: "room",
+		CockpitPaneKey: "seat",
+		Result: &AgentResult{
+			Decision: "approved",
+			Summary:  "done",
+			Delegations: []Delegation{
+				{ID: "api", Agent: "api", Action: "review", Prompt: "build api"},
+			},
+		},
+	})
+	if err := engine.AdvanceJob(ctx, "parent-job"); err != nil {
+		t.Fatalf("AdvanceJob(parent): %v", err)
+	}
+	completeDelegationChild(t, store, "parent-job/delegation/api", JobSucceeded, AgentResult{Decision: "approved", Summary: "api ok"})
+	if err := engine.AdvanceJob(ctx, "parent-job/delegation/api"); err != nil {
+		t.Fatalf("AdvanceJob(api): %v", err)
+	}
+	continuation := mustJob(t, store, delegationContinuationID("parent-job"))
+	cp, err := unmarshalPayload(continuation.Payload)
+	if err != nil {
+		t.Fatalf("unmarshal continuation payload: %v", err)
+	}
+	if !cp.Cockpit || cp.CockpitSession != "room" || cp.CockpitPaneKey != "seat" {
+		t.Fatalf("continuation cockpit fields = (%t, %q, %q), want (true, room, seat)", cp.Cockpit, cp.CockpitSession, cp.CockpitPaneKey)
+	}
+}
+
 func TestEngineDelegationFailurePolicyBlockParent(t *testing.T) {
 	ctx := context.Background()
 	store := openEngineStore(t)
@@ -2314,6 +2356,34 @@ func TestEngineDelegationRequestCopiesModel(t *testing.T) {
 	)
 	if request.Model != "opus" {
 		t.Fatalf("request.Model = %q, want %q", request.Model, "opus")
+	}
+}
+
+func TestEngineDelegationRequestInheritsCockpit(t *testing.T) {
+	engine := Engine{}
+	request := engine.delegationRequest(
+		db.Job{ID: "parent-job", Agent: "audit"},
+		JobPayload{Repo: "plotarmordev/gitmoot", Cockpit: true, CockpitSession: "room", CockpitPaneKey: "seat"},
+		Delegation{ID: "del-1", Agent: "helper", Action: "review", Prompt: "go"},
+	)
+	if !request.Cockpit {
+		t.Fatalf("request.Cockpit = false, want true (inherited from coordinator)")
+	}
+	if request.CockpitSession != "room" {
+		t.Fatalf("request.CockpitSession = %q, want %q", request.CockpitSession, "room")
+	}
+	if request.CockpitPaneKey != "seat" {
+		t.Fatalf("request.CockpitPaneKey = %q, want %q", request.CockpitPaneKey, "seat")
+	}
+
+	// A coordinator that did not opt in produces children with cockpit off.
+	off := engine.delegationRequest(
+		db.Job{ID: "parent-job", Agent: "audit"},
+		JobPayload{Repo: "plotarmordev/gitmoot"},
+		Delegation{ID: "del-2", Agent: "helper", Action: "review", Prompt: "go"},
+	)
+	if off.Cockpit {
+		t.Fatalf("request.Cockpit = true, want false when coordinator did not opt in")
 	}
 }
 
