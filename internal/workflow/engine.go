@@ -588,6 +588,7 @@ func (e Engine) delegationRequest(job db.Job, payload JobPayload, d Delegation) 
 		FailurePolicy:   strings.TrimSpace(d.FailurePolicy),
 		SynthesisRule:   strings.TrimSpace(d.SynthesisRule),
 		Model:           strings.TrimSpace(d.Model),
+		Phase:           strings.TrimSpace(d.Phase),
 		// Cockpit settings are inherited from the coordinator so every delegation
 		// subagent in one tree renders a pane under the same workspace/session.
 		Cockpit:        payload.Cockpit,
@@ -911,6 +912,7 @@ func (e Engine) handleDelegationLoop(ctx context.Context, job db.Job, payload Jo
 		Agent:           job.Agent,
 		Action:          "ask",
 		Model:           payload.Model,
+		Phase:           payload.Phase,
 		Repo:            payload.Repo,
 		Branch:          payload.Branch,
 		PullRequest:     payload.PullRequest,
@@ -968,6 +970,7 @@ func (e Engine) enqueueFinalizeContinuation(ctx context.Context, job db.Job, pay
 		Agent:              job.Agent,
 		Action:             "ask",
 		Model:              payload.Model,
+		Phase:              payload.Phase,
 		Repo:               payload.Repo,
 		Branch:             payload.Branch,
 		PullRequest:        payload.PullRequest,
@@ -1482,6 +1485,7 @@ func (e Engine) maybeEnqueueContinuation(ctx context.Context, parentJob db.Job, 
 		Agent:        parentJob.Agent,
 		Action:       "ask",
 		Model:        parentPayload.Model,
+		Phase:        parentPayload.Phase,
 		Repo:         parentPayload.Repo,
 		Branch:       parentPayload.Branch,
 		PullRequest:  parentPayload.PullRequest,
@@ -1882,6 +1886,9 @@ func buildContinuationPrompt(parentResult *AgentResult, children map[string]db.J
 			summary = strings.TrimSpace(payload.Result.Summary)
 		}
 		fmt.Fprintf(&builder, "- delegation %q (job %s, agent %s): %s", d.ID, child.ID, child.Agent, decision)
+		if phase := strings.TrimSpace(d.Phase); phase != "" {
+			fmt.Fprintf(&builder, " [phase: %s]", phase)
+		}
 		if summary != "" {
 			fmt.Fprintf(&builder, " — %s", summary)
 		}
