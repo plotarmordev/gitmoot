@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -50,6 +51,14 @@ type OrchestratePolicy struct {
 	// unlimited/off, so default behavior is unchanged. The daemon wires this into
 	// Engine.MaxDelegationCostUSD at startup.
 	MaxDelegationCostUSD float64
+	// EscalationHandle is the GitHub login the escalate_human notifier @-tags when
+	// a tree pauses awaiting a human (#340). Empty (the default) falls back to the
+	// PR author, then the repo owner, so a notification always names someone.
+	EscalationHandle string
+	// EscalationTTL is how long a tree may sit paused awaiting a human before the
+	// daemon's background scan auto-finalizes it (#340), as a Go duration string.
+	// Empty (the default) uses DefaultEscalationTTL (24h); the daemon parses it.
+	EscalationTTL string
 	// MaxDelegationNonProgressStreak is the per-root threshold for the result-aware
 	// non-progress loop detector (#339): how many consecutive continuation
 	// generations a delegation tree may produce with no new durable side effect
@@ -58,6 +67,10 @@ type OrchestratePolicy struct {
 	// Engine.MaxDelegationNonProgressStreak at startup.
 	MaxDelegationNonProgressStreak int
 }
+
+// DefaultEscalationTTL is the fallback time a paused-for-human tree may sit
+// before the daemon auto-finalizes it gracefully (#340).
+const DefaultEscalationTTL = "24h"
 
 func DefaultOrchestratePolicy() OrchestratePolicy {
 	return OrchestratePolicy{
@@ -69,6 +82,8 @@ func DefaultOrchestratePolicy() OrchestratePolicy {
 		InlineArtifactMaxBytes:         0,
 		MaxDelegationTokenBudget:       0,
 		MaxDelegationCostUSD:           0,
+		EscalationHandle:               "",
+		EscalationTTL:                  "",
 		MaxDelegationNonProgressStreak: 0,
 	}
 }
@@ -141,6 +156,14 @@ func applyOrchestratePolicyField(policy *OrchestratePolicy, key string, value st
 		parsed, err := strconv.ParseFloat(value, 64)
 		policy.MaxDelegationCostUSD = parsed
 		return err
+	case "escalation_handle":
+		parsed, err := parseConfigString(value)
+		policy.EscalationHandle = strings.TrimPrefix(strings.TrimSpace(parsed), "@")
+		return err
+	case "escalation_ttl":
+		parsed, err := parseConfigString(value)
+		policy.EscalationTTL = strings.TrimSpace(parsed)
+		return err
 	case "max_delegation_non_progress_streak":
 		parsed, err := strconv.Atoi(value)
 		policy.MaxDelegationNonProgressStreak = parsed
@@ -169,6 +192,15 @@ func validateOrchestratePolicy(policy OrchestratePolicy) error {
 	}
 	if policy.MaxDelegationCostUSD < 0 {
 		return fmt.Errorf("orchestrate.max_delegation_cost_usd must be 0 (unlimited) or positive")
+	}
+	if ttl := strings.TrimSpace(policy.EscalationTTL); ttl != "" {
+		parsed, err := time.ParseDuration(ttl)
+		if err != nil {
+			return fmt.Errorf("orchestrate.escalation_ttl %q is invalid: %w", ttl, err)
+		}
+		if parsed <= 0 {
+			return fmt.Errorf("orchestrate.escalation_ttl must be positive")
+		}
 	}
 	if policy.MaxDelegationNonProgressStreak < 0 {
 		return fmt.Errorf("orchestrate.max_delegation_non_progress_streak must be 0 (engine default) or positive")
