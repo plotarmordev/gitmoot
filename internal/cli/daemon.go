@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,8 +60,8 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 
 func printDaemonUsage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
-	fmt.Fprintln(w, "  gitmoot daemon start [--repo owner/repo] [--poll 30s] [--workers 1] [--watch-skillopt-reviews] [--watch-issues]")
-	fmt.Fprintln(w, "  gitmoot daemon run [--repo owner/repo] [--poll 30s] [--workers 1] [--watch-skillopt-reviews] [--watch-issues]")
+	fmt.Fprintln(w, "  gitmoot daemon start [--repo owner/repo] [--poll 30s] [--workers 1 | --parallel N] [--scheduler barrier|pool] [--watch-skillopt-reviews] [--watch-issues]")
+	fmt.Fprintln(w, "  gitmoot daemon run [--repo owner/repo] [--poll 30s] [--workers 1 | --parallel N] [--scheduler barrier|pool] [--watch-skillopt-reviews] [--watch-issues]")
 	fmt.Fprintln(w, "  gitmoot daemon stop")
 	fmt.Fprintln(w, "  gitmoot daemon restart")
 	fmt.Fprintln(w, "  gitmoot daemon status")
@@ -137,6 +138,26 @@ func parseSchedulerMode(mode string) (bool, error) {
 	}
 }
 
+// autoSelectScheduler makes `--workers > 1` actually deliver parallelism (#444).
+// Requesting multiple workers under the default `barrier` scheduler almost never
+// does what the user wants — same-repo jobs serialize on one per-tick wg.Wait()
+// and one per-repo checkout lock — so when more than one worker is requested and
+// the scheduler was left at its default, auto-select `pool`. An explicit
+// `--scheduler barrier` is always honored (explicitScheduler == true), preserving
+// the old per-tick behavior for callers who deliberately want it.
+//
+// It returns the resolved scheduler mode string ("barrier"/"pool") so callers can
+// surface it and persist it in the daemon's child args.
+func autoSelectScheduler(scheduler string, workers int, explicitScheduler bool) string {
+	if explicitScheduler {
+		return scheduler
+	}
+	if workers > 1 && strings.TrimSpace(scheduler) != "pool" {
+		return "pool"
+	}
+	return scheduler
+}
+
 func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("daemon run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -151,6 +172,7 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 	watchSkillOptReviews := fs.Bool("watch-skillopt-reviews", false, "poll watched SkillOpt review issue comments and import valid feedback")
 	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<agent> ask comments to jobs (#389)")
 	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
+	parallel := fs.Int("parallel", 0, "run jobs in parallel: sets --workers N and --scheduler pool together (#444)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -161,6 +183,31 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "daemon run does not accept positional arguments")
 		return 2
 	}
+	explicitWorkers, explicitScheduler, explicitParallel := false, false, false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "workers":
+			explicitWorkers = true
+		case "scheduler":
+			explicitScheduler = true
+		case "parallel":
+			explicitParallel = true
+		}
+	})
+	// --parallel N is intent-level sugar for --workers N + --scheduler pool (#444).
+	if explicitParallel {
+		if explicitWorkers || explicitScheduler {
+			fmt.Fprintln(stderr, "--parallel cannot be combined with --workers or --scheduler")
+			return 2
+		}
+		if *parallel <= 0 {
+			fmt.Fprintln(stderr, "--parallel must be positive")
+			return 2
+		}
+		*workers = *parallel
+		*scheduler = "pool"
+		explicitScheduler = true
+	}
 	if *poll <= 0 {
 		fmt.Fprintln(stderr, "poll interval must be positive")
 		return 2
@@ -169,6 +216,9 @@ func runDaemonRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "workers must be positive")
 		return 2
 	}
+	// Auto-select pool when multiple workers are requested without an explicit
+	// scheduler (#444); explicit --scheduler barrier still forces per-tick.
+	*scheduler = autoSelectScheduler(*scheduler, *workers, explicitScheduler)
 	usePool, schedErr := parseSchedulerMode(*scheduler)
 	if schedErr != nil {
 		fmt.Fprintln(stderr, schedErr.Error())
@@ -376,11 +426,52 @@ func runDaemonStatus(args []string, stdout, stderr io.Writer) int {
 	}
 	writeLine(stdout, "log: %s", state.LogFile)
 	if pid > 0 {
+		if meta, err := readDaemonMeta(state); err == nil {
+			writeLine(stdout, "%s", daemonSchedulerStatusLine(meta.Args))
+		}
 		writeLine(stdout, "%s", daemonClaudeAuthLine(paths))
 	}
 	writeLine(stdout, "%s", daemonAdmissionLine(paths))
 	writeLine(stdout, "%s", daemonPreflightFailureLine(*home))
 	return 0
+}
+
+// daemonSchedulerStatusLine reports the running daemon's worker count and
+// scheduler mode (#444) by reading the resolved child args persisted at start.
+// Surfacing both answers "is the daemon configured for the parallelism I asked
+// for?" from `daemon status` without re-deriving it from launch flags, and notes
+// that same-repo parallelism still needs distinct runtime sessions (the runtime
+// session lock is a second serialization layer beyond the checkout lock).
+func daemonSchedulerStatusLine(args []string) string {
+	workers := daemonArgValue(args, "workers")
+	if workers == "" {
+		workers = "1"
+	}
+	scheduler := daemonArgValue(args, "scheduler")
+	if scheduler == "" {
+		scheduler = "barrier"
+	}
+	line := fmt.Sprintf("scheduler: %s, workers: %s", scheduler, workers)
+	if scheduler == "barrier" && workers != "1" {
+		line += " (barrier serializes same-repo jobs; relaunch with --scheduler pool for parallelism)"
+	}
+	return line
+}
+
+// daemonArgValue extracts the value of a `--name value` or `--name=value` flag
+// from a persisted daemon child-arg slice, returning "" when absent.
+func daemonArgValue(args []string, name string) string {
+	long := "--" + name
+	prefix := long + "="
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == long && i+1 < len(args):
+			return args[i+1]
+		case strings.HasPrefix(args[i], prefix):
+			return strings.TrimPrefix(args[i], prefix)
+		}
+	}
+	return ""
 }
 
 // daemonPreflightFailureLine reports how many coordinator jobs currently carry a
@@ -528,6 +619,7 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 	watchSkillOptReviews := fs.Bool("watch-skillopt-reviews", false, "poll watched SkillOpt review issue comments and import valid feedback")
 	watchIssues := fs.Bool("watch-issues", false, "poll open issues and route @<agent> ask comments to jobs (#389)")
 	scheduler := fs.String("scheduler", "barrier", "queued-job scheduler: barrier (default) or pool (#394 opt-in continuous worker pool)")
+	parallel := fs.Int("parallel", 0, "run jobs in parallel: sets --workers N and --scheduler pool together (#444)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return daemonStartConfig{}, daemonHelp
@@ -548,6 +640,7 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 		WatchIssues:          *watchIssues,
 		Scheduler:            *scheduler,
 	}
+	explicitParallel := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "repo":
@@ -571,8 +664,32 @@ func parseDaemonStartConfig(command string, args []string, stderr io.Writer) (da
 		case "scheduler":
 			cfg.ExplicitScheduler = true
 			cfg.ExplicitStartConfig = true
+		case "parallel":
+			explicitParallel = true
+			cfg.ExplicitStartConfig = true
 		}
 	})
+	// --parallel N is intent-level sugar: it sets workers=N + scheduler=pool
+	// together (#444), so the user names the goal rather than two orthogonal knobs.
+	// It conflicts with explicit --workers/--scheduler to avoid silently winning.
+	if explicitParallel {
+		if cfg.ExplicitWorkers || cfg.ExplicitScheduler {
+			fmt.Fprintln(stderr, "--parallel cannot be combined with --workers or --scheduler")
+			return daemonStartConfig{}, 2
+		}
+		if *parallel <= 0 {
+			fmt.Fprintln(stderr, "--parallel must be positive")
+			return daemonStartConfig{}, 2
+		}
+		cfg.Workers = *parallel
+		cfg.ExplicitWorkers = true
+		cfg.Scheduler = "pool"
+		cfg.ExplicitScheduler = true
+	}
+	// Auto-select pool when multiple workers are requested without an explicit
+	// scheduler, so --workers N actually parallelizes (#444). An explicit
+	// --scheduler barrier still forces the old per-tick behavior.
+	cfg.Scheduler = autoSelectScheduler(cfg.Scheduler, cfg.Workers, cfg.ExplicitScheduler)
 	if cfg.RepoFlag != "" {
 		repo, err := daemon.ParseRepository(cfg.RepoFlag)
 		if err != nil {
@@ -1645,6 +1762,16 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 	if limit <= 0 {
 		return nil
 	}
+	// Preflight (#444): if the config can't actually run same-repo jobs in
+	// parallel (single worker, or the per-tick barrier scheduler) yet ≥2
+	// parallelizable jobs are queued, surface the exact relaunch command instead
+	// of silently serializing them. "Parallelizable" = same repo, dep-unblocked
+	// (already true of queued jobs), and DISTINCT runtime sessions — same-session
+	// jobs serialize on the runtime session lock even under pool, so counting raw
+	// same-repo jobs would over-warn.
+	if serializingConfig(worker.UsePool, limit) {
+		warnSerializedParallelJobs(ctx, worker, limit, repoFilter, rootFilter)
+	}
 	if worker.UsePool {
 		return runQueuedJobsForRepoPool(ctx, worker, limit, repoFilter, rootFilter)
 	}
@@ -1704,6 +1831,121 @@ func runQueuedJobsForRepo(ctx context.Context, worker jobWorker, limit int, repo
 		}
 	}
 	return nil
+}
+
+// serializingConfig reports whether the daemon's scheduler config cannot run
+// same-repo jobs in parallel (#444): a single worker, or the per-tick barrier
+// scheduler (which serializes same-repo jobs on one wg.Wait() + checkout lock).
+func serializingConfig(usePool bool, limit int) bool {
+	return limit <= 1 || !usePool
+}
+
+// parallelizableSerialJobs counts the queued jobs for this repo/session filter
+// that could run concurrently but won't under a serializing config (#444):
+// distinct runtime sessions among same-repo dep-unblocked queued jobs. Jobs with
+// no resolvable runtime session key are counted individually (each is its own
+// would-be parallel slot). The count is what the preflight warns on (≥2). The
+// returned signature uniquely identifies the parallelizable session set so the
+// preflight can de-duplicate an unchanged backlog across ticks.
+func parallelizableSerialJobs(ctx context.Context, worker jobWorker, repoFilter string, rootFilter string) (int, string) {
+	pending, err := listPendingQueuedJobs(ctx, worker, repoFilter, rootFilter)
+	if err != nil {
+		return 0, ""
+	}
+	// Cheap short-circuit: with fewer than 2 pending same-repo jobs there can
+	// never be ≥2 parallelizable slots, so skip the per-job session lookups
+	// (queuedJobRuntimeResourceKey → Store.GetAgent) entirely. This keeps the
+	// common-case (default single-worker, empty/small backlog) off the DB hot
+	// path beyond the single ListQueuedJobs the listing already performs.
+	if len(pending) < 2 {
+		return 0, ""
+	}
+	sessions := map[string]bool{}
+	for _, job := range pending {
+		key := queuedJobRuntimeResourceKey(ctx, worker.Store, job)
+		if key == "" {
+			// Each session-less job is its own parallel slot; key it by job ID
+			// so the dedup signature still reflects backlog changes. The job-ID
+			// key already makes it a distinct entry in `sessions`, so it must NOT
+			// also be counted separately or the slot would be double-counted.
+			sessions["job:"+job.ID] = true
+			continue
+		}
+		sessions[key] = true
+	}
+	count := len(sessions)
+	if count < 2 {
+		return count, ""
+	}
+	keys := make([]string, 0, len(sessions))
+	for k := range sessions {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return count, strings.Join(keys, "\n")
+}
+
+// preflightWarnThrottle de-duplicates the serializing-config preflight warning
+// (#444) across worker ticks. runQueuedJobsForRepo is called once per poll
+// (default 30s), so a steady backlog under a serializing config would otherwise
+// re-log the identical line every tick. We re-emit only when the parallelizable
+// session set changes or a quiet interval has elapsed, keyed by repo filter.
+type preflightWarnState struct {
+	signature string
+	at        time.Time
+}
+
+var (
+	preflightWarnMu     sync.Mutex
+	preflightWarnByRepo = map[string]preflightWarnState{}
+	preflightWarnReWarn = 30 * time.Minute
+)
+
+// resetPreflightWarnThrottle clears the preflight de-dup state. Test-only.
+func resetPreflightWarnThrottle() {
+	preflightWarnMu.Lock()
+	defer preflightWarnMu.Unlock()
+	preflightWarnByRepo = map[string]preflightWarnState{}
+}
+
+// shouldEmitPreflightWarn reports whether the warning for this repo/signature
+// should be emitted now, recording the decision so an unchanged backlog stays
+// quiet until either the session set changes or preflightWarnReWarn elapses.
+func shouldEmitPreflightWarn(repoKey string, signature string, now time.Time) bool {
+	preflightWarnMu.Lock()
+	defer preflightWarnMu.Unlock()
+	prev, ok := preflightWarnByRepo[repoKey]
+	if ok && prev.signature == signature && now.Sub(prev.at) < preflightWarnReWarn {
+		return false
+	}
+	preflightWarnByRepo[repoKey] = preflightWarnState{signature: signature, at: now}
+	return true
+}
+
+// warnSerializedParallelJobs emits an actionable preflight warning when ≥2
+// parallelizable jobs are queued under a serializing config (#444), printing the
+// exact relaunch command. It is best-effort and never blocks the tick, and is
+// rate-limited so an unchanged backlog does not re-log every poll.
+func warnSerializedParallelJobs(ctx context.Context, worker jobWorker, limit int, repoFilter string, rootFilter string) {
+	count, signature := parallelizableSerialJobs(ctx, worker, repoFilter, rootFilter)
+	if count < 2 {
+		return
+	}
+	repo := strings.TrimSpace(repoFilter)
+	target := "the daemon"
+	repoKey := "*"
+	if repo != "" {
+		target = repo
+		repoKey = repo
+	}
+	if !shouldEmitPreflightWarn(repoKey, signature, time.Now()) {
+		return
+	}
+	workers := limit
+	if workers < count {
+		workers = count
+	}
+	writeLine(worker.Stdout, "warning: %d parallelizable jobs queued for %s will run serially under the current scheduler config; relaunch with: gitmoot daemon restart --parallel %d", count, target, workers)
 }
 
 // listPendingQueuedJobs returns the queued jobs eligible to run for this
