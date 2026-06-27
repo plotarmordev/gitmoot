@@ -4538,3 +4538,31 @@ func TestEngineResultAwareStreakIdempotentOnReadvance(t *testing.T) {
 		t.Fatalf("delegation_continuation_enqueued fired %d times under re-advance, want 1", got)
 	}
 }
+
+// TestEffectiveDelegationBoundsEnvOverride covers #22: the depth/total-jobs bounds
+// are env-overridable (so a council coordinator's long continuation chains aren't
+// strangled by the default-8 depth), defaulting to the safe consts when unset.
+func TestEffectiveDelegationBoundsEnvOverride(t *testing.T) {
+	if got := effectiveMaxDelegationDepth(); got != MaxDelegationDepth {
+		t.Fatalf("default depth = %d, want %d", got, MaxDelegationDepth)
+	}
+	if got := effectiveMaxDelegationTotalJobs(); got != MaxDelegationTotalJobs {
+		t.Fatalf("default total-jobs = %d, want %d", got, MaxDelegationTotalJobs)
+	}
+	t.Setenv("GITMOOT_MAX_DELEGATION_DEPTH", "32")
+	t.Setenv("GITMOOT_MAX_DELEGATION_TOTAL_JOBS", "128")
+	if got := effectiveMaxDelegationDepth(); got != 32 {
+		t.Fatalf("override depth = %d, want 32", got)
+	}
+	if got := effectiveMaxDelegationTotalJobs(); got != 128 {
+		t.Fatalf("override total-jobs = %d, want 128", got)
+	}
+	t.Setenv("GITMOOT_MAX_DELEGATION_DEPTH", "0")
+	if got := effectiveMaxDelegationDepth(); got != MaxDelegationDepth {
+		t.Fatalf("zero override -> %d, want default %d", got, MaxDelegationDepth)
+	}
+	t.Setenv("GITMOOT_MAX_DELEGATION_DEPTH", "notanint")
+	if got := effectiveMaxDelegationDepth(); got != MaxDelegationDepth {
+		t.Fatalf("invalid override -> %d, want default %d", got, MaxDelegationDepth)
+	}
+}
