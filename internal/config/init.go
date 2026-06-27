@@ -114,6 +114,14 @@ escalation_ttl = ""
 #     path is byte-identical. It only writes feedback + updates the posterior;
 #     promotion stays MANUAL. Each intercepted ask runs the runtime twice (cost),
 #     which is why it is sampled and floored.
+#   mode_b_judge_enabled (#483 Mode B): OFF by default. When true (or with the
+#     per-invocation 'skillopt ab --judge' flag), in addition to the human pick a
+#     CROSS-FAMILY LLM judge (a DIFFERENT runtime family than the agent under test)
+#     also picks the better of the two shuffled A/B answers and records a SEPARATE
+#     skillopt-ab-judge feedback row that COEXISTS with (and weights BELOW) the human
+#     row. The judge is cross-family ONLY (skipped — never same-family — when no other
+#     family is available), NEVER touches the promotion bandit, and is never the sole
+#     gate; its trust is DEFERRED to MEASURE-THE-JUDGE (#344). Off ⇒ byte-identical.
 # [skillopt]
 # auto_trace_enabled = false
 # cross_family_review_enabled = false
@@ -127,6 +135,7 @@ escalation_ttl = ""
 # auto_promote_min_confidence = 0.95
 # bandit_min_samples = 30
 # live_ab_sample_rate = 0.0
+# mode_b_judge_enabled = false
 
 # [admission] is an OPT-IN, off-by-default host-global concurrency budget the
 # daemon applies BEFORE starting each agent session, on top of --workers/pool

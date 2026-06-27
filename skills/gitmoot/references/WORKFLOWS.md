@@ -500,6 +500,17 @@ feedback + updates the posterior; it never auto-promotes or rolls back a version
 The cross-family LLM-judge auto-pairwise, canary, and the unattended auto A/B loop
 remain deferred.
 
+Pass **`--judge`** (or set `[skillopt].mode_b_judge_enabled = true`, both **off by
+default**, #483) to ALSO have a **cross-family LLM judge** (a different runtime
+family than the agent under test) pick A/B from the **same shuffled** options and
+record a **separate** `RankedFeedbackEvent` (`reviewer`/`source =
+skillopt-ab-judge`) that **coexists with** and **weights below** the human row.
+The judge is **cross-family only** (skipped — never same-family — when no other
+family is available), **never** touches the promotion bandit, drops fail-safe on
+unparseable output, and its trust is **deferred to measure-the-judge (#344)**.
+`--judge-only` records only the judge row (skips the human prompt). Off ⇒
+byte-identical.
+
 ## Execution Model
 
 Use `here` when the current chat should answer directly from the Gitmoot skill.

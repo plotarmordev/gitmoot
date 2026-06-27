@@ -455,6 +455,19 @@ type SkillOptPolicy struct {
 	// automatic path. The promotion side reuses AutoPromoteMinSamples.
 	BanditMinSamples *int
 
+	// ModeBJudgeEnabled opts the manual `skillopt ab` command into the off-by-default
+	// cross-family LLM-judge auto-pairwise path (#483): when true (OR the per-invocation
+	// --judge flag is passed), in addition to the human pick a CROSS-FAMILY LLM judge
+	// (a different runtime family than the agent under test) also picks the better of
+	// the two shuffled A/B answers and records its own SEPARATE RankedFeedbackEvent
+	// tagged reviewer=skillopt-ab-judge / source=skillopt-ab-judge. The judge row
+	// COEXISTS with (never overwrites) the human row and is weighted BELOW human by
+	// the source tag. Empty/false (the default) means OFF: no cross-family judge is
+	// selected, no judge delivery happens, no judge row is written — byte-identical to
+	// the #473 human-only Mode B path. The judge NEVER touches the promotion bandit
+	// and is NEVER the sole gate; its trust is explicitly deferred to MEASURE-THE-JUDGE
+	// (#344) — judge-tagged + weighted-low now, calibrated later.
+	ModeBJudgeEnabled bool
 	// LiveABSampleRate is the live-traffic A/B (#482) sampling probability in
 	// [0,1]: the fraction of foreground `agent ask` calls (on a managed agent
 	// above BanditMinSamples) that are intercepted into a champion-vs-challenger
@@ -482,6 +495,7 @@ func DefaultSkillOptPolicy() SkillOptPolicy {
 		AutoPromoteCanary:               false,
 		AutoPromoteMinConfidence:        nil,
 		BanditMinSamples:                nil,
+		ModeBJudgeEnabled:               false,
 		LiveABSampleRate:                nil,
 	}
 }
@@ -603,6 +617,10 @@ func applySkillOptPolicyField(policy *SkillOptPolicy, key string, value string) 
 		}
 		policy.BanditMinSamples = &parsed
 		return nil
+	case "mode_b_judge_enabled":
+		parsed, err := strconv.ParseBool(value)
+		policy.ModeBJudgeEnabled = parsed
+		return err
 	case "live_ab_sample_rate":
 		parsed, err := parseConfigFloat(value)
 		if err != nil {
