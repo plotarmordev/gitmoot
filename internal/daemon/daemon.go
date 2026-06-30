@@ -393,6 +393,11 @@ func (d Daemon) pullRequestReadyToMerge(ctx context.Context, pull github.PullReq
 		}
 		return false, err
 	}
+	if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef); err == nil && lock.SkipNativeReviewFanout {
+		return false, nil
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
 	return task.State == string(workflow.TaskReadyToMerge), nil
 }
 
@@ -407,6 +412,9 @@ func (d Daemon) handleReadyToMergeWorkflow(ctx context.Context, pull github.Pull
 	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
+	}
+	if lock.SkipNativeReviewFanout {
+		return nil
 	}
 	leadAgent := strings.TrimSpace(lock.Owner)
 	if leadAgent == "" {
@@ -510,6 +518,11 @@ func (d Daemon) retryClosedReadyToMerge(ctx context.Context, openBranches map[st
 	for _, task := range tasks {
 		if task.Branch == "" {
 			continue
+		}
+		if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), task.Branch); err == nil && lock.SkipNativeReviewFanout {
+			continue
+		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
 		}
 		if _, open := openBranches[task.Branch]; open {
 			continue
@@ -1142,9 +1155,15 @@ func (d Daemon) handleMergeCommand(ctx context.Context, pull github.PullRequest,
 		return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot cannot merge PR #%d because task `%s` is `%s`, not `%s`.", pull.Number, task.ID, task.State, workflow.TaskReadyToMerge))
 	}
 	leadAgent := "github"
-	if lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef); err == nil && strings.TrimSpace(lock.Owner) != "" {
-		leadAgent = lock.Owner
-	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	lock, err := d.Store.GetBranchLock(ctx, d.Repo.FullName(), pull.HeadRef)
+	if err == nil {
+		if lock.SkipNativeReviewFanout {
+			return d.ack(ctx, pull.Number, fmt.Sprintf("Gitmoot native merge is disabled for PR #%d because branch `%s` is managed by an external council gate.", pull.Number, pull.HeadRef))
+		}
+		if strings.TrimSpace(lock.Owner) != "" {
+			leadAgent = lock.Owner
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	reviewers, err := d.workflowReviewers(ctx)

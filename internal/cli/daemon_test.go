@@ -3404,6 +3404,26 @@ func TestNewDaemonPolicyMergeGateIncludesWorktreeCleaner(t *testing.T) {
 	}
 }
 
+func TestDaemonMergeGateCanBeDisabledByEnvironment(t *testing.T) {
+	t.Setenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE", "1")
+	gate := daemonMergeGate{}
+
+	decision, err := gate.Evaluate(context.Background(), workflow.MergeRequest{
+		Repo:        "owner/repo",
+		PullRequest: 1,
+	})
+
+	if err != nil {
+		t.Fatalf("Evaluate returned error: %v", err)
+	}
+	if decision.Ready {
+		t.Fatalf("decision.Ready = true, want disabled gate to block")
+	}
+	if !strings.Contains(decision.Reason, "GITMOOT_DISABLE_NATIVE_MERGE_GATE") {
+		t.Fatalf("decision reason = %q", decision.Reason)
+	}
+}
+
 func TestDaemonMergeGatePreservesInjectedGitHubClient(t *testing.T) {
 	fake := github.NoopClient{}
 	gate := daemonMergeGate{GitHub: fake}

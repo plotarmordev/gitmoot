@@ -365,10 +365,11 @@ type PullRequestEvent struct {
 	LeadAgent         string
 	Sender            string
 	RequiredReviewers []string
-	// SkipReviewFanout, when true, suppresses the native review-fanout loop in
-	// HandlePullRequestOpened: zero review jobs are enqueued and the PR runs the
-	// same no-reviewers tail (record baseline + merge gate) the zero-reviewers
-	// case already runs, so the PR still advances. Defaults false => full fanout.
+	// SkipReviewFanout, when true, suppresses Gitmoot's native PR advancement in
+	// HandlePullRequestOpened: zero review jobs are enqueued, the PR baseline is
+	// recorded, and the native merge gate is not run. Council-style external
+	// orchestrators use this to make their own gate the only merge authority.
+	// Defaults false => full native fanout/advancement.
 	SkipReviewFanout bool
 }
 
@@ -705,10 +706,10 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	if len(reviewers) == 0 {
 		reviewers = compactStrings(append([]string{}, e.RequiredReviewers...))
 	}
-	// When the caller asked to skip the native review fanout, run the exact same
-	// no-reviewers tail the zero-reviewers case runs (merge gate + baseline) so the
-	// PR still advances, but enqueue ZERO review jobs.
-	if len(reviewers) == 0 || event.SkipReviewFanout {
+	if event.SkipReviewFanout {
+		return e.recordPullRequestBaseline(ctx, event)
+	}
+	if len(reviewers) == 0 {
 		decision, err := e.runMergeGate(ctx, "", JobPayload{
 			Repo:        event.Repo,
 			Branch:      event.Branch,

@@ -4578,11 +4578,26 @@ type daemonMergeGate struct {
 }
 
 func (g daemonMergeGate) Evaluate(ctx context.Context, request workflow.MergeRequest) (workflow.MergeDecision, error) {
+	if nativeMergeGateDisabled() {
+		return workflow.MergeDecision{
+			Ready:  false,
+			Reason: "native Gitmoot merge gate disabled by GITMOOT_DISABLE_NATIVE_MERGE_GATE; use external gate",
+		}, nil
+	}
 	checkout, err := mergeGateCheckout(ctx, g.Store, request.Repo, g.FallbackCheckout)
 	if err != nil {
 		return workflow.MergeDecision{}, err
 	}
 	return newDaemonPolicyMergeGate(g.Store, g.githubClient(checkout), checkout).Evaluate(ctx, request)
+}
+
+func nativeMergeGateDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GITMOOT_DISABLE_NATIVE_MERGE_GATE"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (g daemonMergeGate) githubClient(checkout string) github.Client {
