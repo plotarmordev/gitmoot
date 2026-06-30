@@ -157,10 +157,11 @@ type PullRequestEvent struct {
 	LeadAgent         string
 	Sender            string
 	RequiredReviewers []string
-	// SkipReviewFanout, when true, suppresses the native review-fanout loop in
-	// HandlePullRequestOpened: zero review jobs are enqueued and the PR runs the
-	// same no-reviewers tail (record baseline + merge gate) the zero-reviewers
-	// case already runs, so the PR still advances. Defaults false => full fanout.
+	// SkipReviewFanout, when true, suppresses Gitmoot's native PR advancement in
+	// HandlePullRequestOpened: zero review jobs are enqueued, the PR baseline is
+	// recorded, and the native merge gate is not run. Council-style external
+	// orchestrators use this to make their own gate the only merge authority.
+	// Defaults false => full native fanout/advancement.
 	SkipReviewFanout bool
 }
 
@@ -287,10 +288,10 @@ func (e Engine) HandlePullRequestOpened(ctx context.Context, event PullRequestEv
 	if len(reviewers) == 0 {
 		reviewers = compactStrings(append([]string{}, e.RequiredReviewers...))
 	}
-	// When the caller asked to skip the native review fanout, run the exact same
-	// no-reviewers tail the zero-reviewers case runs (merge gate + baseline) so the
-	// PR still advances, but enqueue ZERO review jobs.
-	if len(reviewers) == 0 || event.SkipReviewFanout {
+	if event.SkipReviewFanout {
+		return e.recordPullRequestBaseline(ctx, event)
+	}
+	if len(reviewers) == 0 {
 		decision, err := e.runMergeGate(ctx, "", JobPayload{
 			Repo:        event.Repo,
 			Branch:      event.Branch,
@@ -971,8 +972,9 @@ func envIntOr(name string, def int) int {
 // after ~1 fix cycle) raise the bounds via env, WITHOUT weakening the safe default
 // for every other gitmoot user. The other backstops (width, wall-clock, token/cost
 // budgets) still bound runaway recursion. Env (positive ints):
-//   GITMOOT_MAX_DELEGATION_DEPTH       (default MaxDelegationDepth = 8)
-//   GITMOOT_MAX_DELEGATION_TOTAL_JOBS  (default MaxDelegationTotalJobs = 64)
+//
+//	GITMOOT_MAX_DELEGATION_DEPTH       (default MaxDelegationDepth = 8)
+//	GITMOOT_MAX_DELEGATION_TOTAL_JOBS  (default MaxDelegationTotalJobs = 64)
 func effectiveMaxDelegationDepth() int {
 	return envIntOr("GITMOOT_MAX_DELEGATION_DEPTH", MaxDelegationDepth)
 }
@@ -2694,7 +2696,7 @@ const maxUpstreamDepSummaryPreviewBytes = 280
 // deps[] as real dataflow. For each of d's succeeded DIRECT deps (sorted by id for
 // stable output), it emits a header line —
 //
-//	- dep <id> (agent <a>, action <act>): <decision> — <summary preview> (<PR>) [changes_made: N] [head <sha7>]
+//   - dep <id> (agent <a>, action <act>): <decision> — <summary preview> (<PR>) [changes_made: N] [head <sha7>]
 //
 // then the dep's artifact_body as a fenced, byte-budgeted block reusing
 // appendInlineArtifactBody (the SAME per-body cap and shared aggregate budget the

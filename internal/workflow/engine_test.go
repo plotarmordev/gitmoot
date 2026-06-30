@@ -597,8 +597,6 @@ func TestEngineHandlePullRequestOpenedSkipsReviewFanout(t *testing.T) {
 	seedAgent(t, store, "lead", []string{"implement"}, "plotarmordev/gitmoot")
 	seedAgent(t, store, "audit", []string{"review"}, "plotarmordev/gitmoot")
 	engine := testEngine(store)
-	// A ready-but-not-merged gate so the no-reviewers tail runs to completion and
-	// records the baseline (the same tail the zero-reviewers path runs).
 	gate := &fakeMergeGate{decision: MergeDecision{Ready: true}}
 	engine.MergeGate = gate
 
@@ -619,7 +617,7 @@ func TestEngineHandlePullRequestOpenedSkipsReviewFanout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HandlePullRequestOpened returned error: %v", err)
 	}
-	assertTaskState(t, store, "task-7", TaskReadyToMerge)
+	assertTaskState(t, store, "task-7", TaskPullRequestOpen)
 	// Zero review jobs enqueued despite a required reviewer being present.
 	jobs, err := store.ListJobs(ctx)
 	if err != nil {
@@ -630,8 +628,9 @@ func TestEngineHandlePullRequestOpenedSkipsReviewFanout(t *testing.T) {
 			t.Fatalf("expected no review jobs, found %+v", job)
 		}
 	}
-	// The merge gate (no-reviewers tail) still ran.
-	if len(gate.requests) != 1 || gate.requests[0].PullRequest != 7 || !gate.requests[0].ReviewOptional {
+	// The native merge gate does not run; an external council gate owns merge
+	// authority for skip-native-review-fanout branches.
+	if len(gate.requests) != 0 {
 		t.Fatalf("merge gate requests = %+v", gate.requests)
 	}
 	// Baseline still recorded so the PR advances.
@@ -673,11 +672,8 @@ func TestEngineAdvanceImplementPersistsSkipReviewFanoutOntoLock(t *testing.T) {
 
 	err := engine.AdvanceJob(ctx, "implement-job")
 
-	// The no-reviewers tail blocks on the pending gate; trigger 1 must have fired
-	// (no review jobs) and the flag must be persisted onto the lock (trigger 2).
-	var blocked BlockedError
-	if !errors.As(err, &blocked) || blocked.Reason != "ci is pending" {
-		t.Fatalf("error = %v, want merge gate BlockedError", err)
+	if err != nil {
+		t.Fatalf("AdvanceJob returned error: %v", err)
 	}
 	jobs, err := store.ListJobs(ctx)
 	if err != nil {
@@ -695,6 +691,10 @@ func TestEngineAdvanceImplementPersistsSkipReviewFanoutOntoLock(t *testing.T) {
 	if !lock.SkipNativeReviewFanout {
 		t.Fatalf("expected lock.SkipNativeReviewFanout = true, got %+v", lock)
 	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none for skip-native-review-fanout", gate.requests)
+	}
+	assertTaskState(t, store, "task-7", TaskPullRequestOpen)
 }
 
 func TestEngineAdvanceImplementDispatchesReviewers(t *testing.T) {

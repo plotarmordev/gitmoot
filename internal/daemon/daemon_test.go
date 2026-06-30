@@ -300,9 +300,9 @@ func TestHandlePullRequestWorkflowSkipsReviewFanoutWhenLockSet(t *testing.T) {
 			t.Fatalf("expected no review jobs with skip set, found %+v", job)
 		}
 	}
-	// The no-reviewers tail still ran (merge gate evaluated, baseline recorded).
-	if len(gate.requests) != 1 || gate.requests[0].PullRequest != 7 {
-		t.Fatalf("merge gate requests = %+v", gate.requests)
+	// The baseline is recorded, but native merge authority is skipped entirely.
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none for skip-native-review-fanout", gate.requests)
 	}
 	if _, err := store.GetPullRequest(ctx, repo.FullName(), 7); err != nil {
 		t.Fatalf("GetPullRequest returned error: %v", err)
@@ -852,6 +852,73 @@ func TestPollOnceRetriesReadyToMergePullRequestWithoutHeadChange(t *testing.T) {
 	}
 	if len(gate.requests) != 1 || gate.requests[0].PullRequest != 7 || gate.requests[0].HeadSHA != "abc123" {
 		t.Fatalf("merge gate requests = %+v", gate.requests)
+	}
+}
+
+func TestPollOnceDoesNotRetryReadyToMergeWhenNativeFanoutSkipped(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-7",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1",
+		Title:        "Task 7",
+		State:        string(workflow.TaskReadyToMerge),
+		Branch:       "task-7",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if err := store.UpsertAgent(ctx, db.Agent{
+		Name:           "builder",
+		Role:           "builder",
+		Runtime:        "codex",
+		RuntimeRef:     "last",
+		RepoScope:      repo.FullName(),
+		Capabilities:   []string{"implement"},
+		AutonomyPolicy: "auto",
+		HealthStatus:   "ok",
+	}); err != nil {
+		t.Fatalf("UpsertAgent returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-7", Owner: "builder"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.SetBranchLockReviewFanout(ctx, repo.FullName(), "task-7", true); err != nil {
+		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
+	}
+	if err := store.UpsertPullRequest(ctx, db.PullRequest{
+		RepoFullName: repo.FullName(),
+		Number:       7,
+		URL:          "https://github.com/plotarmordev/gitmoot/pull/7",
+		HeadBranch:   "task-7",
+		BaseBranch:   "main",
+		HeadSHA:      "abc123",
+		State:        "open",
+	}); err != nil {
+		t.Fatalf("UpsertPullRequest returned error: %v", err)
+	}
+	client := &fakeGitHub{
+		pulls: []github.PullRequest{{
+			Number:  7,
+			Title:   "Task 7",
+			State:   "open",
+			URL:     "https://github.com/plotarmordev/gitmoot/pull/7",
+			HeadRef: "task-7",
+			BaseRef: "main",
+			HeadSHA: "abc123",
+		}},
+		comments: map[int64][]github.IssueComment{7: {}},
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	daemon := Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}
+
+	if err := daemon.PollOnce(ctx); err != nil {
+		t.Fatalf("PollOnce returned error: %v", err)
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none for skip-native-review-fanout branch", gate.requests)
 	}
 }
 
@@ -1879,6 +1946,46 @@ func TestPollOnceMergeCommandRunsMergeGate(t *testing.T) {
 	}
 	if task.State != string(workflow.TaskMerged) {
 		t.Fatalf("task state = %q, want merged", task.State)
+	}
+}
+
+func TestPollOnceMergeCommandRefusesSkipNativeFanoutBranch(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	repo := github.Repository{Owner: "jerryfane", Name: "gitmoot"}
+	if err := store.UpsertTask(ctx, db.Task{
+		ID:           "task-010",
+		RepoFullName: repo.FullName(),
+		GoalID:       "goal-1",
+		Title:        "Task 10",
+		State:        string(workflow.TaskReadyToMerge),
+		Branch:       "task-10",
+	}); err != nil {
+		t.Fatalf("UpsertTask returned error: %v", err)
+	}
+	if acquired, err := store.AcquireLock(ctx, db.BranchLock{RepoFullName: repo.FullName(), Branch: "task-10", Owner: "builder"}); err != nil || !acquired {
+		t.Fatalf("AcquireLock returned acquired=%v err=%v", acquired, err)
+	}
+	if err := store.SetBranchLockReviewFanout(ctx, repo.FullName(), "task-10", true); err != nil {
+		t.Fatalf("SetBranchLockReviewFanout returned error: %v", err)
+	}
+	gate := &fakeWorkflowMergeGate{decision: workflow.MergeDecision{Ready: true, Merged: true, MergeCommitSHA: "merge123"}}
+	engine := workflow.Engine{Store: store, MergeGate: gate}
+	client := &fakeGitHub{}
+	err := (Daemon{Repo: repo, Store: store, GitHub: client, Workflow: &engine}).handleMergeCommand(
+		ctx,
+		github.PullRequest{Number: 10, Title: "Task 10", State: "open", HeadRef: "task-10", BaseRef: "main", HeadSHA: "abc123"},
+		github.IssueComment{ID: 910, Body: "/gitmoot merge", Author: "dana"},
+	)
+
+	if err != nil {
+		t.Fatalf("handleMergeCommand returned error: %v", err)
+	}
+	if len(gate.requests) != 0 {
+		t.Fatalf("merge gate requests = %+v, want none", gate.requests)
+	}
+	if len(client.posted) != 1 || !strings.Contains(client.posted[0].body, "external council gate") {
+		t.Fatalf("posted acknowledgements = %+v", client.posted)
 	}
 }
 
