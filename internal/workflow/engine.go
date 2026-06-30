@@ -794,6 +794,115 @@ func (e Engine) HandlePullRequestReadyToMerge(ctx context.Context, event PullReq
 	return err
 }
 
+// HandleReviewPullRequestClosed reconciles a task wedged in `reviewing` whose
+// pull request is no longer open on GitHub (#543). The daemon poll loop only
+// lists OPEN pull requests, so once a reviewing task's PR is closed — most often
+// a duplicate/superseded PR that a cleanup job closed on GitHub — nothing
+// re-routes the task and it stays in `reviewing` pointing at a stale `open`
+// local PR row forever.
+//
+// It is idempotent and narrowly scoped: it acts ONLY when the task is still in
+// `reviewing`, so any already-advanced task (a genuinely-open PR still under
+// review, or one already merged/blocked) is left untouched and the healthy
+// merge/open paths are never regressed. It transitions the task out of
+// `reviewing` and rewrites the stale local PR row to its true state: a merged PR
+// resolves the task to `merged`; a closed-unmerged PR resolves it to the
+// terminal `blocked` state (there is no open PR left to review or merge, so it
+// surfaces to a human). Existing PR row fields (url/base/merge SHA) are
+// preserved — only the state (and, when merged, head SHA) is reconciled.
+func (e Engine) HandleReviewPullRequestClosed(ctx context.Context, event PullRequestEvent, merged bool) error {
+	if err := e.validate(); err != nil {
+		return err
+	}
+	if err := validatePullRequestEvent(event); err != nil {
+		return err
+	}
+	ref := taskRefFromPullRequest(event)
+	task, err := e.Store.GetTask(ctx, ref.ID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	}
+	if task.State != string(TaskReviewing) {
+		return nil
+	}
+	prState := "closed"
+	taskState := TaskBlocked
+	if merged {
+		prState = "merged"
+		taskState = TaskMerged
+	}
+	if err := e.setTaskState(ctx, ref, taskState); err != nil {
+		return err
+	}
+	pr := db.PullRequest{
+		RepoFullName: event.Repo,
+		Number:       int64(event.PullRequest),
+		HeadBranch:   event.Branch,
+		HeadSHA:      event.HeadSHA,
+		State:        prState,
+	}
+	if existing, err := e.Store.GetPullRequest(ctx, event.Repo, int64(event.PullRequest)); err == nil {
+		pr.URL = existing.URL
+		pr.BaseBranch = existing.BaseBranch
+		pr.MergeCommitSHA = existing.MergeCommitSHA
+		if strings.TrimSpace(pr.HeadSHA) == "" {
+			pr.HeadSHA = existing.HeadSHA
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := e.Store.UpsertPullRequest(ctx, pr); err != nil {
+		return err
+	}
+	if merged {
+		// An externally-merged PR detected by the reconciler must release the branch
+		// lock and remove the task worktree, exactly as the canonical merge path
+		// (PolicyMergeGate.finishMerged) does. Without this the reconcile method
+		// would set TaskMerged but strand the branch lock (held forever) and leak
+		// the task worktree on disk — the "strands a lock / leaves a worktree" class
+		// that accumulates under unattended automation. The blocked branch
+		// deliberately keeps the worktree/lock for human resumption, so only the
+		// merged branch cleans up.
+		e.reconcileMergedCleanup(ctx, event.Repo, task)
+	}
+	return nil
+}
+
+// reconcileMergedCleanup releases the branch lock and removes the task worktree
+// after HandleReviewPullRequestClosed resolves an externally-merged reviewing
+// task to `merged` (#543). It mirrors PolicyMergeGate.finishMerged's post-merge
+// cleanup so the self-heal reconcile path does not leak a held branch lock or an
+// on-disk worktree. Every step is best-effort and nil-safe: failures are
+// swallowed so the already-durable terminal `merged` transition is never undone,
+// matching finishMerged's treatment of these as non-fatal post-merge warnings.
+func (e Engine) reconcileMergedCleanup(ctx context.Context, repo string, task db.Task) {
+	if branch := strings.TrimSpace(task.Branch); branch != "" {
+		if lock, err := e.Store.GetBranchLock(ctx, repo, branch); err == nil {
+			_, _ = e.Store.ReleaseLockWithEvent(ctx, lock, db.BranchLockEvent{
+				Kind:    "released",
+				Message: "released after pull request merged (reconciled #543)",
+			})
+		}
+	}
+	path := strings.TrimSpace(task.WorktreePath)
+	if path == "" {
+		return
+	}
+	// Force-remove: the work is already merged, so a leftover dirty/locked worktree
+	// (the common reason a non-force removal fails) must not block reclaiming it.
+	manager, ok := e.DelegationWorktrees.(ReadOnlyWorktreeManager)
+	if !ok {
+		return
+	}
+	if err := manager.RemoveWorktreeForce(ctx, path); err != nil {
+		return
+	}
+	_ = e.Store.ClearTaskWorktreePath(ctx, task.ID)
+}
+
 func (e Engine) RunJob(ctx context.Context, jobID string, agent runtime.Agent, adapter DeliveryAdapter) (AgentResult, error) {
 	if err := e.validate(); err != nil {
 		return AgentResult{}, err
