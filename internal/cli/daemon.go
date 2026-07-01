@@ -1298,7 +1298,7 @@ func runRegisteredRepoSupervisor(ctx context.Context, home string, poll time.Dur
 			if err := recoverCancelledRunningJobsForEnabledRepos(ctx, store, rootFilter, stdout); err != nil {
 				return err
 			}
-			workerErr = startSupervisorWorkerLoop(ctx, daemonWorkerLoopInterval, func(now time.Time) error {
+			workerErr = startSupervisorWorkerLoopRecovering(ctx, daemonWorkerLoopInterval, stdout, func(now time.Time) error {
 				return runEnabledRepoWorkerTicksWithLocks(ctx, store, worker, workers, rootFilter, stdout, now, checkoutLocks)
 			})
 			startCockpitReconcileLoop(ctx, store, paths.Home, stdout)
@@ -1360,7 +1360,7 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 	worker.UsePool = usePool
 	worker.Admission = worker.loadAdmissionBudget()
 	var checkoutLock sync.Mutex
-	workerErr := startSupervisorWorkerLoop(ctx, daemonWorkerLoopInterval, func(now time.Time) error {
+	workerErr := startSupervisorWorkerLoopRecovering(ctx, daemonWorkerLoopInterval, stdout, func(now time.Time) error {
 		checkoutLock.Lock()
 		defer checkoutLock.Unlock()
 		return runDaemonWorkerTick(ctx, store, worker, workers, false, d.Repo.FullName(), rootFilter, stdout, now)
@@ -1383,10 +1383,10 @@ func runSingleRepoSupervisor(ctx context.Context, home string, d daemon.Daemon, 
 			return err
 		}
 		if checkoutLock.TryLock() {
-			_ = d.PollOnce(ctx)
+			_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce)
 			checkoutLock.Unlock()
 		} else {
-			_ = d.PollRecoveryCommandsOnce(ctx)
+			_ = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce)
 		}
 		if heartbeatPathsErr == nil {
 			if err := runHeartbeatScanOnce(ctx, heartbeatPaths, store, heartbeatEnqueue, time.Now().UTC()); err != nil {
@@ -1622,30 +1622,111 @@ func runOneHeartbeat(ctx context.Context, store *db.Store, enqueue heartbeatEnqu
 }
 
 func startSupervisorWorkerLoop(ctx context.Context, interval time.Duration, run func(time.Time) error) <-chan error {
+	return startSupervisorWorkerLoopInternal(ctx, interval, nil, run, false)
+}
+
+func startSupervisorWorkerLoopRecovering(ctx context.Context, interval time.Duration, stdout io.Writer, run func(time.Time) error) <-chan error {
+	return startSupervisorWorkerLoopInternal(ctx, interval, stdout, run, true)
+}
+
+// maxConsecutiveWorkerTickFailures bounds how many CONSECUTIVE recovering
+// worker-tick failures the supervisor tolerates before it stops retrying and
+// surfaces the error on its channel so the caller (the daemon) exits and
+// systemd restarts/alerts. plotarmordev's #555 made a single transient tick error
+// survivable (the daemon no longer wedges), but retry-forever turned a
+// PERMANENT infra fault — job-level failures already return nil, so what bubbles
+// up here is disk-full / corrupt-or-locked SQLite / a failed migration — into a
+// silent false-green daemon: status still "running", zero progress, ~86k log
+// lines/day. The streak resets to 0 on any successful tick, so only a genuinely
+// stuck daemon escalates. At the capped backoff below this spans a few minutes
+// before escalating (1+2+4+8+16 then 30s each ≈ 4m for a 1s base interval).
+const maxConsecutiveWorkerTickFailures = 12
+
+// maxWorkerTickBackoff caps the exponential retry sleep applied to a persistent
+// recovering-loop fault, so a permanent error backs off to the poll cadence
+// instead of spinning at the 1s base interval and flooding the journal.
+const maxWorkerTickBackoff = 30 * time.Second
+
+func startSupervisorWorkerLoopInternal(ctx context.Context, interval time.Duration, stdout io.Writer, run func(time.Time) error, recoverErrors bool) <-chan error {
 	errCh := make(chan error, 1)
 	if interval <= 0 {
 		interval = daemonWorkerLoopInterval
 	}
 	go func() {
 		defer close(errCh)
+		consecutiveFailures := 0
 		for {
 			if err := ctx.Err(); err != nil {
 				return
 			}
 			if err := run(time.Now().UTC()); err != nil {
-				errCh <- err
-				return
+				// A cancellation observed mid-tick is a clean shutdown, never a
+				// fault: return WITHOUT logging or counting it toward the
+				// escalation streak, so graceful shutdown stays quiet and never
+				// pushes context.Canceled onto errCh.
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					return
+				}
+				if !recoverErrors {
+					errCh <- err
+					return
+				}
+				consecutiveFailures++
+				// A PERSISTENT fault (a bounded streak of consecutive tick
+				// errors) is infra-level, not a transient blip: escalate it so
+				// the daemon exits instead of spinning silently forever.
+				if consecutiveFailures >= maxConsecutiveWorkerTickFailures {
+					writeLine(stdout, "daemon worker tick error: %v; %d consecutive failures, escalating", err, consecutiveFailures)
+					errCh <- err
+					return
+				}
+				writeLine(stdout, "daemon worker tick error: %v; retrying (%d/%d)", err, consecutiveFailures, maxConsecutiveWorkerTickFailures)
+				if sleepErr := sleepSupervisorWorkerLoop(ctx, workerTickBackoff(interval, consecutiveFailures)); sleepErr != nil {
+					return
+				}
+				continue
 			}
-			timer := time.NewTimer(interval)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
+			// A successful tick clears the streak: only CONSECUTIVE failures
+			// escalate, so one bad pass between good ones never trips the ceiling.
+			consecutiveFailures = 0
+			if err := sleepSupervisorWorkerLoop(ctx, interval); err != nil {
 				return
-			case <-timer.C:
 			}
 		}
 	}()
 	return errCh
+}
+
+// workerTickBackoff returns the retry sleep for the Nth consecutive recovering
+// worker-tick failure: the base interval doubled per failure, capped at
+// maxWorkerTickBackoff. consecutiveFailures==1 returns the base interval (his
+// original single-transient-error cadence is preserved).
+func workerTickBackoff(base time.Duration, consecutiveFailures int) time.Duration {
+	if base <= 0 {
+		base = daemonWorkerLoopInterval
+	}
+	backoff := base
+	for i := 1; i < consecutiveFailures; i++ {
+		if backoff >= maxWorkerTickBackoff {
+			return maxWorkerTickBackoff
+		}
+		backoff *= 2
+	}
+	if backoff > maxWorkerTickBackoff {
+		return maxWorkerTickBackoff
+	}
+	return backoff
+}
+
+func sleepSupervisorWorkerLoop(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func receiveSupervisorWorkerError(errCh <-chan error) error {
@@ -1901,10 +1982,16 @@ func (p registeredRepoPoller) pollRepo(ctx context.Context, repoRecord db.Repo, 
 		EscalationTTL:          p.EscalationTTL,
 		RevertDetectionEnabled: p.RevertDetectionEnabled,
 	}
+	// Bound the poll the same way the single-repo supervisor does (#555 / #536):
+	// this call runs while HOLDING the per-repo checkout lock (deferred Unlock
+	// above), so a wedged PollOnce would hold that lock forever and freeze this
+	// repo's worker ticks — the exact stall #555 targets. The timeout only
+	// bounds the poll; the lock's per-repo checkout semantics are unchanged
+	// because Unlock still runs via defer once the (now-bounded) poll returns.
 	if recoveryOnly {
-		err = d.PollRecoveryCommandsOnce(ctx)
+		err = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollRecoveryCommandsOnce)
 	} else {
-		err = d.PollOnce(ctx)
+		err = runDaemonPollWithTimeout(ctx, daemonPollTimeout, d.PollOnce)
 	}
 	lastError := ""
 	if err != nil {
@@ -2008,6 +2095,19 @@ const daemonRunningJobStaleAfter = 30 * time.Minute
 const daemonJobCancelPollInterval = 250 * time.Millisecond
 const daemonWorkerLoopInterval = 1 * time.Second
 
+// daemonPollTimeout bounds a single repo's PollOnce / PollRecoveryCommandsOnce.
+// The poll runs while HOLDING that repo's checkout lock, and both supervisors
+// take each repo's lock SEQUENTIALLY, so a wedged (ctx-respecting-but-slow)
+// poll on one repo freezes that repo's — and, in the multi-repo sweep, every
+// later repo's — worker ticks until it returns (#555 / #536). It is therefore a
+// hard STALL bound, not the expected poll duration: reusing
+// daemonRunningJobStaleAfter (30 min) here left the sweep frozen for up to half
+// an hour, largely defeating #555's anti-stall goal, so it is deliberately much
+// tighter. A healthy poll finishes well inside this; exceeding it means the poll
+// is wedged and cancelling it (the deferred checkout Unlock still runs, so no
+// lock leak) is the correct recovery.
+const daemonPollTimeout = 2 * time.Minute
+
 // cockpitReconcileInterval is the low-frequency cadence of the cockpit reconcile
 // GC sweep (Task 7): it drops cockpit_pane rows whose herdr pane is gone and whose
 // owning root is terminal. It runs rarely because it is a backstop for the
@@ -2050,6 +2150,15 @@ func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, std
 		writeLine(stdout, "recovered %d expired runtime session locks", deleted)
 	}
 	return nil
+}
+
+func runDaemonPollWithTimeout(ctx context.Context, timeout time.Duration, poll func(context.Context) error) error {
+	if timeout <= 0 {
+		return poll(ctx)
+	}
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return poll(pollCtx)
 }
 
 func recoverRunningJobsBefore(ctx context.Context, store *db.Store, stdout io.Writer, before time.Time) error {
@@ -2268,23 +2377,49 @@ func runEnabledRepoWorkerTicksWithLocks(ctx context.Context, store *db.Store, wo
 	if err != nil {
 		return err
 	}
+	// Scope tick faults per repo (#555 follow-up): the recovering supervisor
+	// treats a returned error as one fleet-wide failure unit and, after a bounded
+	// streak, exits the WHOLE daemon. Returning on the first repo's error would
+	// let a single repo-local fault (e.g. a broken/permission-denied checkout
+	// dir) both starve every later repo in ListRepos order AND escalate/kill the
+	// healthy repos' daemon with it. So log a single repo's tick error and keep
+	// sweeping; only a fault hitting EVERY enabled repo — a shared/store-level
+	// fault such as locked/corrupt SQLite or disk-full, the genuine global fault
+	// #555's escalation targets — is returned so the supervisor can escalate.
+	enabled := 0
+	failed := 0
+	var lastErr error
 	for _, repo := range repos {
 		if !repo.Enabled {
 			continue
 		}
+		enabled++
 		lock := locks.For(repo.FullName())
 		if lock != nil {
 			lock.Lock()
 		}
-		if err := runDaemonWorkerTick(ctx, store, worker, workers, false, repo.FullName(), rootFilter, stdout, now); err != nil {
-			if lock != nil {
-				lock.Unlock()
-			}
-			return err
-		}
+		tickErr := runDaemonWorkerTick(ctx, store, worker, workers, false, repo.FullName(), rootFilter, stdout, now)
 		if lock != nil {
 			lock.Unlock()
 		}
+		if tickErr != nil {
+			// A cancellation observed mid-sweep is a clean shutdown, not a repo
+			// fault: propagate it immediately so the supervisor treats it as such
+			// (and it never counts toward or masks the escalation streak).
+			if errors.Is(tickErr, context.Canceled) || ctx.Err() != nil {
+				return tickErr
+			}
+			failed++
+			lastErr = tickErr
+			writeLine(stdout, "%s: worker tick error: %v", repo.FullName(), tickErr)
+		}
+	}
+	// Every enabled repo failing is the global-fault signal: return it so the
+	// recovering supervisor's streak can trip and escalate. A single-repo daemon
+	// (enabled==1) still escalates on its own persistent fault, matching the
+	// single-repo supervisor.
+	if enabled > 0 && failed == enabled {
+		return lastErr
 	}
 	return nil
 }
@@ -4256,14 +4391,17 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 
 // effectiveJobTimeout returns the timeout to enforce for a job: the
 // per-delegation payload.JobTimeout when it parses to a positive duration,
-// otherwise the agent-type managed.JobTimeout (which is zero when the agent is
-// not managed). The same value drives both the runtime-session lock TTL and the
-// run context deadline so the lock cannot expire before the job does.
+// otherwise the agent-type managed.JobTimeout, otherwise the daemon stale window
+// for unmanaged jobs. The same value drives both the runtime-session lock TTL and
+// the run context deadline so a job cannot outlive the lease that guards it.
 func effectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeConfig) time.Duration {
 	if d, err := time.ParseDuration(strings.TrimSpace(payload.JobTimeout)); err == nil && d > 0 {
 		return d
 	}
-	return managed.JobTimeout
+	if managed.JobTimeout > 0 {
+		return managed.JobTimeout
+	}
+	return daemonRunningJobStaleAfter
 }
 
 func originalAgentForTempWorkerType(typ string) string {
