@@ -2092,6 +2092,32 @@ func (w jobWorker) eventSink() events.Sink {
 }
 
 const daemonRunningJobStaleAfter = 30 * time.Minute
+const defaultDaemonRunningJobStaleAfter = daemonRunningJobStaleAfter
+
+// daemonRunningJobStaleFloor is the smallest GITMOOT_STALE_RUNNING_AFTER we
+// honor. The stale-running window is a CRASH BACKSTOP, not a job timeout: it is
+// how long a job may sit in 'running' with no lease progress before the daemon
+// assumes the worker died and requeues it. A tiny value (e.g. 1s) turns that
+// backstop into an aggressive killer — especially for NON-resumable runtimes
+// (shell/no runtime-session lock) where runtimeOwnerLeaseHeld is always false,
+// so there is no lease to protect a live worker and the coarse threshold is the
+// ONLY gate. Sub-floor values are rejected in favor of the default (#560).
+const daemonRunningJobStaleFloor = 1 * time.Minute
+
+// runtimeLeaseTeardownGrace is added to a job's timeout when sizing its
+// runtime-session lock lease so the lease strictly OUTLIVES the run-context
+// deadline plus worst-case terminal teardown (runtime subprocess kill + worktree
+// force-clean). run() arms the run context at exactly jobTimeout but holds the
+// lease through that teardown, which happens AFTER the deadline fires. Without
+// this margin the lease would expire in the window [t0+jobTimeout,
+// t0+jobTimeout+teardown] while the worker is STILL ALIVE finishing — and
+// recoverExpiredRuntimeSessionLocks + DeleteExpiredResourceLocks (runtime:%
+// bypasses the not-running guard) would reap that live worker's lock and requeue
+// its still-'running' owner, starting a SECOND worker on the dirty in-flight
+// worktree: the exact #536 clobber. With the grace a NORMALLY-terminating worker
+// always releases its lease before it expires; only a genuinely stuck/crashed
+// worker past jobTimeout+grace is reaped and requeued.
+const runtimeLeaseTeardownGrace = 2 * time.Minute
 const daemonJobCancelPollInterval = 250 * time.Millisecond
 const daemonWorkerLoopInterval = 1 * time.Second
 
@@ -2136,12 +2162,72 @@ func defaultJobWorker(store *db.Store, stdout io.Writer, home ...string) jobWork
 	return worker
 }
 
+// staleFloorWarnOnce keeps the sub-floor warning from flooding the log: the
+// recovery path that reads this runs once per worker-loop tick (~1s), so we warn
+// at most once per daemon process.
+var staleFloorWarnOnce sync.Once
+
+// configuredDaemonRunningJobStaleAfter resolves the crash-backstop window from
+// GITMOOT_STALE_RUNNING_AFTER, falling back to the default when unset, malformed,
+// non-positive, OR below daemonRunningJobStaleFloor. This is a CRASH BACKSTOP,
+// not a timeout: it bounds how long a job may sit 'running' with no lease
+// progress before the daemon assumes the worker crashed and requeues it. A
+// sub-floor value (e.g. 1s) would let the backstop requeue live workers — most
+// dangerously for non-resumable runtimes that hold no lease — so it is rejected
+// with a one-time warning rather than honored (#560).
+func configuredDaemonRunningJobStaleAfter(stdout io.Writer) time.Duration {
+	raw := strings.TrimSpace(os.Getenv("GITMOOT_STALE_RUNNING_AFTER"))
+	if raw == "" {
+		return defaultDaemonRunningJobStaleAfter
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return defaultDaemonRunningJobStaleAfter
+	}
+	if d < daemonRunningJobStaleFloor {
+		staleFloorWarnOnce.Do(func() {
+			writeLine(stdout, "GITMOOT_STALE_RUNNING_AFTER=%s is below the %s crash-backstop floor; using default %s", raw, daemonRunningJobStaleFloor, defaultDaemonRunningJobStaleAfter)
+		})
+		return defaultDaemonRunningJobStaleAfter
+	}
+	return d
+}
+
 func recoverRunningJobs(ctx context.Context, store *db.Store, stdout io.Writer) error {
 	now := time.Now().UTC()
-	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-daemonRunningJobStaleAfter), "", "")
+	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), "", "")
 }
 
 func recoverExpiredRuntimeSessionLocks(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time) error {
+	expiredRuntimeLocks, err := store.ListExpiredRuntimeSessionLocks(ctx, now)
+	if err != nil {
+		return err
+	}
+	// Requeue owners BEFORE reaping the lock rows. An expired runtime lease means
+	// the job's real timeout + teardown grace has elapsed, so a still-'running'
+	// owner is genuinely stale (a normally-terminating worker releases its lock
+	// before the grace-padded lease expires — see runtimeLeaseTeardownGrace).
+	// Ordering requeue-then-delete keeps the two durable: if a mid-loop DB error
+	// aborts the sweep, the un-processed locks are still expired and get retried
+	// next tick, instead of being deleted up front and losing the requeue signal
+	// (which would strand those owners as 'running' until the coarse 30m window).
+	// TransitionJobStateWithEvent is a no-op unless the owner is still 'running'.
+	for _, lock := range expiredRuntimeLocks {
+		if strings.TrimSpace(lock.OwnerJobID) == "" {
+			continue
+		}
+		recovered, err := store.TransitionJobStateWithEvent(ctx, lock.OwnerJobID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
+			JobID:   lock.OwnerJobID,
+			Kind:    string(workflow.JobQueued),
+			Message: "recovered running job after runtime session lock expired",
+		})
+		if err != nil {
+			return err
+		}
+		if recovered {
+			writeLine(stdout, "requeued running job %s after runtime session lock expired", lock.OwnerJobID)
+		}
+	}
 	deleted, err := store.DeleteExpiredResourceLocks(ctx, now)
 	if err != nil {
 		return err
@@ -2167,7 +2253,7 @@ func recoverRunningJobsBefore(ctx context.Context, store *db.Store, stdout io.Wr
 
 func recoverRunningJobsForRepo(ctx context.Context, store *db.Store, stdout io.Writer, repoFilter string, rootFilter string) error {
 	now := time.Now().UTC()
-	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-daemonRunningJobStaleAfter), repoFilter, rootFilter)
+	return recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), repoFilter, rootFilter)
 }
 
 func recoverCancelledRunningJobsForEnabledRepos(ctx context.Context, store *db.Store, rootFilter string, stdout io.Writer) error {
@@ -2215,40 +2301,47 @@ func recoverRunningJobsBeforeForRepo(ctx context.Context, store *db.Store, stdou
 		if !queuedJobMatchesRepo(job, repoFilter) || !queuedJobMatchesSession(job, rootFilter) {
 			continue
 		}
-		// Liveness gate (#536): the coarse `updated_at < before` threshold (30m) is a
-		// crash backstop, NOT a timeout. A long-running job (e.g. a 4h delegation)
-		// holds a runtime-session lock whose LEASE reflects its real job timeout. If
-		// that lease has not elapsed the job's timeout has not elapsed, so leave it
-		// running — requeuing it would start a second copy that fails on the dirty
-		// in-flight worktree and then force-cleans it out from under the live worker.
-		//
-		// This keys on the lease, NOT on the lock's owner PID: the recorded PID is the
-		// gitmoot DAEMON's, not the spawned runtime worker's, so on a daemon restart it
-		// is the dead prior daemon even while the reparented worker keeps running — the
-		// exact path this recovery is named for. Honoring the lease is correct across a
-		// restart (the lease survives in the DB) and immune to PID reuse. The trade-off:
-		// a genuinely-crashed worker whose daemon also died is recovered only once its
-		// lease expires (recoverExpiredRuntimeSessionLocks reclaims it, then a later
-		// tick requeues it) rather than at the 30m threshold — promptness traded for
-		// never failing live work, the unattended-reliability goal of #536.
-		leaseHeld, err := runtimeOwnerLeaseHeld(ctx, store, job.ID, now)
-		if err != nil {
+		if err := recoverRunningJobIfLeaseExpired(ctx, store, stdout, now, job); err != nil {
 			return err
 		}
-		if leaseHeld {
-			continue
-		}
-		recovered, err := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
-			JobID:   job.ID,
-			Kind:    string(workflow.JobQueued),
-			Message: "recovered stale running job on daemon startup",
-		})
-		if err != nil {
-			return err
-		}
-		if recovered {
-			writeLine(stdout, "requeued stale running job %s", job.ID)
-		}
+	}
+	return nil
+}
+
+func recoverRunningJobIfLeaseExpired(ctx context.Context, store *db.Store, stdout io.Writer, now time.Time, job db.Job) error {
+	// Liveness gate (#536): the coarse `updated_at < before` threshold (30m) is a
+	// crash backstop, NOT a timeout. A long-running job (e.g. a 4h delegation)
+	// holds a runtime-session lock whose LEASE reflects its real job timeout. If
+	// that lease has not elapsed the job's timeout has not elapsed, so leave it
+	// running — requeuing it would start a second copy that fails on the dirty
+	// in-flight worktree and then force-cleans it out from under the live worker.
+	//
+	// This keys on the lease, NOT on the lock's owner PID: the recorded PID is the
+	// gitmoot DAEMON's, not the spawned runtime worker's, so on a daemon restart it
+	// is the dead prior daemon even while the reparented worker keeps running — the
+	// exact path this recovery is named for. Honoring the lease is correct across a
+	// restart (the lease survives in the DB) and immune to PID reuse. The trade-off:
+	// a genuinely-crashed worker whose daemon also died is recovered only once its
+	// lease expires (recoverExpiredRuntimeSessionLocks reclaims it, then a later
+	// tick requeues it) rather than at the 30m threshold — promptness traded for
+	// never failing live work, the unattended-reliability goal of #536.
+	leaseHeld, err := runtimeOwnerLeaseHeld(ctx, store, job.ID, now)
+	if err != nil {
+		return err
+	}
+	if leaseHeld {
+		return nil
+	}
+	recovered, err := store.TransitionJobStateWithEvent(ctx, job.ID, string(workflow.JobRunning), string(workflow.JobQueued), db.JobEvent{
+		JobID:   job.ID,
+		Kind:    string(workflow.JobQueued),
+		Message: "recovered stale running job on daemon startup",
+	})
+	if err != nil {
+		return err
+	}
+	if recovered {
+		writeLine(stdout, "requeued stale running job %s", job.ID)
 	}
 	return nil
 }
@@ -2350,7 +2443,7 @@ func runDaemonWorkerTick(ctx context.Context, store *db.Store, worker jobWorker,
 	if dryRun {
 		return nil
 	}
-	if err := recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-daemonRunningJobStaleAfter), repoFilter, rootFilter); err != nil {
+	if err := recoverRunningJobsBeforeForRepo(ctx, store, stdout, now, now.Add(-configuredDaemonRunningJobStaleAfter(stdout)), repoFilter, rootFilter); err != nil {
 		return err
 	}
 	if err := recoverExpiredRuntimeSessionLocks(ctx, store, stdout, now); err != nil {
@@ -3260,9 +3353,16 @@ func (w jobWorker) run(ctx context.Context, job db.Job) error {
 		return nil
 	}
 	jobTimeout := effectiveJobTimeout(payload, managed)
-	lockTTL := daemonRunningJobStaleAfter
+	// Size the runtime-session lease to jobTimeout PLUS a teardown grace so the
+	// lease strictly OUTLIVES the run-context deadline (armed at exactly jobTimeout
+	// below) and the terminal worktree teardown that runs while this lock is still
+	// held. A normally-terminating worker therefore releases its lease before it
+	// expires; without the grace the lease would expire in the live-worker teardown
+	// window and the expired-lock reaper would requeue the still-'running' owner
+	// onto its dirty worktree — the #536 clobber. See runtimeLeaseTeardownGrace.
+	lockTTL := defaultDaemonRunningJobStaleAfter
 	if jobTimeout > 0 {
-		lockTTL = jobTimeout
+		lockTTL = jobTimeout + runtimeLeaseTeardownGrace
 	}
 	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, w.Store, job.ID, agent, time.Now().UTC(), lockTTL)
 	if err != nil {
@@ -3949,7 +4049,14 @@ func (w jobWorker) runWithTempWorker(ctx context.Context, job db.Job, payload wo
 		return nil
 	}
 	writeLine(w.Stdout, "running job %s for temporary worker %s in %s", job.ID, started.Agent.Name, payload.Repo)
-	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, w.Store, delegatedJob.ID, started.Agent, time.Now().UTC(), started.JobTimeout)
+	// Same lease-outlives-context invariant as run(): the temp-worker run context is
+	// armed at started.JobTimeout below, so the lease must be jobTimeout+grace to
+	// cover teardown and avoid the #536 live-worker reap+requeue window.
+	tempLockTTL := defaultDaemonRunningJobStaleAfter
+	if started.JobTimeout > 0 {
+		tempLockTTL = started.JobTimeout + runtimeLeaseTeardownGrace
+	}
+	releaseLock, acquired, lockKey, ownerToken, err := acquireRuntimeSessionLock(ctx, w.Store, delegatedJob.ID, started.Agent, time.Now().UTC(), tempLockTTL)
 	if err != nil {
 		if finishErr := w.finishQueuedJob(ctx, delegatedJob.ID, workflow.JobFailed, err); finishErr != nil {
 			return finishErr
@@ -4111,7 +4218,7 @@ func compactMergeBackStrings(values []string) []string {
 
 func (w jobWorker) startTempWorker(ctx context.Context, job db.Job, payload workflow.JobPayload, original runtime.Agent, checkout string) (tempWorkerStartResult, error) {
 	idleTimeout := 20 * time.Minute
-	jobTimeout := daemonRunningJobStaleAfter
+	jobTimeout := defaultDaemonRunningJobStaleAfter
 	if managed, err := w.managedJobConfig(ctx, original.Name); err == nil && managed.OK {
 		idleTimeout = managed.IdleTimeout
 		jobTimeout = managed.JobTimeout
@@ -4261,7 +4368,7 @@ func (w jobWorker) startEphemeralWorker(ctx context.Context, job db.Job, payload
 		State:          "starting",
 		CreatedAt:      formatManagedAgentTime(now),
 		LastUsedAt:     formatManagedAgentTime(now),
-		ExpiresAt:      formatManagedAgentTime(now.Add(daemonRunningJobStaleAfter)),
+		ExpiresAt:      formatManagedAgentTime(now.Add(defaultDaemonRunningJobStaleAfter)),
 	}
 	if err := w.Store.UpsertAgentInstance(ctx, reserved); err != nil {
 		return err
@@ -4392,8 +4499,12 @@ func (w jobWorker) managedJobConfig(ctx context.Context, agentName string) (mana
 // effectiveJobTimeout returns the timeout to enforce for a job: the
 // per-delegation payload.JobTimeout when it parses to a positive duration,
 // otherwise the agent-type managed.JobTimeout, otherwise the daemon stale window
-// for unmanaged jobs. The same value drives both the runtime-session lock TTL and
-// the run context deadline so a job cannot outlive the lease that guards it.
+// for unmanaged jobs (so an unmanaged job still has a watchdog, #555). This value
+// drives the run context deadline directly; the runtime-session lock TTL is this
+// value PLUS runtimeLeaseTeardownGrace (#536/#560) so the lease strictly outlives
+// the deadline and the terminal teardown — the lock cannot expire while the
+// worker is still finishing, which would otherwise let the reaper requeue a live
+// job onto its dirty worktree.
 func effectiveJobTimeout(payload workflow.JobPayload, managed managedJobRuntimeConfig) time.Duration {
 	if d, err := time.ParseDuration(strings.TrimSpace(payload.JobTimeout)); err == nil && d > 0 {
 		return d
